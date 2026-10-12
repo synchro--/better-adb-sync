@@ -1,9 +1,7 @@
-from typing import Iterable, Tuple
+from typing import Iterable, List, Tuple
 import os
-import subprocess
-import logging
 
-from .Base import FileSystem
+from .Base import FileSystem, chunk_arguments
 
 class LocalFileSystem(FileSystem):
     @property
@@ -19,6 +17,10 @@ class LocalFileSystem(FileSystem):
     def makedirs(self, path: str) -> None:
         os.makedirs(path, exist_ok = True)
 
+    def makedirs_many(self, paths: List[str]) -> None:
+        for path in paths:
+            os.makedirs(path, exist_ok = True)
+
     def realpath(self, path: str) -> str:
         return os.path.realpath(path)
 
@@ -32,6 +34,10 @@ class LocalFileSystem(FileSystem):
     def utime(self, path: str, times: Tuple[int, int]) -> None:
         os.utime(path, times=times)
 
+    def utime_many(self, entries: List[Tuple[str, Tuple[int, int]]]) -> None:
+        for path, times in entries:
+            os.utime(path, times=times)
+
     def join(self, base: str, leaf: str) -> str:
         return os.path.join(base, leaf)
 
@@ -42,11 +48,29 @@ class LocalFileSystem(FileSystem):
         return os.path.normpath(path)
 
     def push_file_here(self, source: str, destination: str, show_progress: bool = False) -> None:
-        adb_cmd = self.adb_arguments + ["pull", source, destination]
-        try:
-            if show_progress:
-                subprocess.check_output(adb_cmd)
-            else:
-                subprocess.run(adb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError as e:
-            logging.critical(f"Non-zero exit code from adb pull for {source} - stderr: {e.stderr}")
+        self._run_transfer_command(
+            self.adb_arguments + ["pull", source, destination],
+            "pull",
+            f"{source} -> {destination}",
+            show_progress = show_progress
+        )
+
+    def push_files_here(self, sources: List[str], destination_dir: str, show_progress: bool = False) -> None:
+        overhead = self._command_overhead_bytes(["pull", destination_dir])
+        for chunk in chunk_arguments(sources, overhead_bytes = overhead):
+            self._run_transfer_command(
+                self.adb_arguments + ["pull"] + chunk + [destination_dir],
+                "pull",
+                f"{len(chunk)} file(s) into {destination_dir} (first: {chunk[0]})",
+                show_progress = show_progress
+            )
+
+    def push_recursive_here(self, source: str, destination: str, show_progress: bool = False) -> None:
+        # -a preserves the source modification times, matching the timestamp
+        # policy of the classic path without any post-copy utime pass.
+        self._run_transfer_command(
+            self.adb_arguments + ["pull", "-a", source, destination],
+            "pull",
+            f"recursive copy of {source} -> {destination}",
+            show_progress = show_progress
+        )

@@ -1,9 +1,10 @@
-"""Behavioral tests of the CURRENT adbsync implementation (no source changes).
+"""Behavioral tests of adbsync (no device, no real adb).
 
 Push and pull are exercised through the installed ``adbsync`` console script
-with ``--adb-bin`` pointing at tests/fake_adb.py. Known current-behavior gaps
-are marked ``xfail`` with an explicit reason so the transfer-optimization
-work can flip them to passing tests.
+with ``--adb-bin`` pointing at tests/fake_adb.py. Formerly-xfailed behavior
+gaps (pull exit code not checked; retries falsely skipped after a failed
+push; same-minute size changes invisible to the mtime-only diff) are now
+fixed and asserted as ordinary passing tests.
 
 ``--del`` is deliberately never used in this suite.
 """
@@ -74,7 +75,8 @@ def test_push_into_missing_destination_directory(harness, tmp_path):
     harness.run_adbsync("push", str(src), "/sdcard/brand-new", expect=0)
 
     assert tree_digest(harness.device_path("sdcard/brand-new")) == tree_digest(src)
-    assert harness.log.count_transfers("push") == 2
+    # Missing destination + default options: one recursive adb push.
+    assert harness.log.count_transfers("push") == 1
 
 
 def test_push_nested_tree_content_parity(harness, tmp_path):
@@ -90,7 +92,8 @@ def test_push_nested_tree_content_parity(harness, tmp_path):
     harness.run_adbsync("push", str(src), "/sdcard/tree", expect=0)
 
     assert tree_digest(harness.device_path("sdcard/tree")) == tree_digest(src)
-    assert harness.log.count_transfers("push") == 4
+    # Missing destination + default options: one recursive adb push.
+    assert harness.log.count_transfers("push") == 1
 
 
 def test_push_filenames_with_spaces_and_unicode(harness, tmp_path):
@@ -109,7 +112,8 @@ def test_push_filenames_with_spaces_and_unicode(harness, tmp_path):
     harness.run_adbsync("push", str(src), "/sdcard/dest", expect=0)
 
     assert tree_digest(harness.device_path("sdcard/dest")) == tree_digest(src)
-    assert harness.log.count_transfers("push") == len(spec)
+    # Missing destination + default options: one recursive adb push.
+    assert harness.log.count_transfers("push") == 1
 
 
 def test_push_trailing_slash_merges_into_existing_directory(harness, tmp_path):
@@ -171,7 +175,8 @@ def test_push_empty_directory_tree(harness, tmp_path):
 
     assert harness.device_path("sdcard/emptytest").is_dir()
     assert harness.device_path("sdcard/emptytest/empty").is_dir()
-    assert harness.log.count_transfers("push") == 0
+    # Empty trees still take the recursive fast path (one adb push, no files).
+    assert harness.log.count_transfers("push") == 1
 
 
 def test_push_missing_source_fails(harness, tmp_path):
@@ -179,6 +184,62 @@ def test_push_missing_source_fails(harness, tmp_path):
     assert result.returncode != 0
     assert "No such file" in result.stderr
     assert not harness.device_path("sdcard/x.txt").exists()
+
+
+def test_push_batched_incremental_with_spaces_and_unicode(harness, tmp_path):
+    """An existing destination uses batched multi-source transfers; argv is
+    passed as a list so spaces/Unicode survive unsplit."""
+    spec = {
+        "with space.txt": b"v1",
+        "café ☃.txt": "v1".encode(),
+        "sub dir/nested name.txt": b"v1",
+    }
+    src = write_tree(tmp_path / "host", spec)
+    for path in src.rglob("*"):
+        if path.is_file():
+            os.utime(path, (FIXED, FIXED))
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest", expect=0)
+
+    for path in sorted(src.rglob("*")):
+        if path.is_file():
+            path.write_bytes(b"v2 " + path.name.encode())
+            os.utime(path, (LATER, LATER))
+
+    harness.reset_log()
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest", expect=0)
+
+    dest = harness.device_path("sdcard/dest")
+    assert (dest / "with space.txt").read_bytes() == b"v2 with space.txt"
+    assert (dest / "café ☃.txt").read_bytes() == "v2 café ☃.txt".encode()
+    assert (dest / "sub dir" / "nested name.txt").read_bytes() == b"v2 nested name.txt"
+    # Two parent directories -> at most two batched processes, never per-file.
+    assert 1 <= harness.log.count_transfers("push") <= 2
+
+
+def test_push_batched_failure_exits_nonzero_and_retry_recopies(harness, tmp_path):
+    src = write_tree(tmp_path / "host", {"a.txt": b"A" * 100, "b.txt": b"B" * 100})
+    for path in src.rglob("*.txt"):
+        os.utime(path, (FIXED, FIXED))
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest", expect=0)
+
+    for path in sorted(src.rglob("*.txt")):
+        path.write_bytes(path.name.encode() * 100)
+        os.utime(path, (LATER, LATER))
+
+    harness.set_fail("push:/sdcard/dest/b.txt")
+    result = harness.run_adbsync("push", str(src) + "/", "/sdcard/dest")
+    assert result.returncode != 0
+    assert "Non-zero exit code from adb push" in result.stderr
+
+    harness.clear_fail()
+    harness.reset_log()
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest", expect=0)
+
+    dest = harness.device_path("sdcard/dest")
+    assert (dest / "a.txt").read_bytes() == b"a.txt" * 100
+    assert (dest / "b.txt").read_bytes() == b"b.txt" * 100
+    # Only the failed file is recopied; the successfully-copied one is skipped.
+    assert harness.log.transferred_files() == 1
 
 
 def test_push_failure_injection_exits_nonzero_without_stamping_mtime(harness, tmp_path):
@@ -197,7 +258,6 @@ def test_push_failure_injection_exits_nonzero_without_stamping_mtime(harness, tm
     assert dest.stat().st_mtime != FIXED_MINUTE
 
 
-@pytest.mark.xfail(reason="pull exit code not checked yet — transfer work will fix")
 def test_pull_failure_injection_surfaces_nonzero_exit(harness, tmp_path):
     device_write(harness, "/sdcard/src/f.txt", b"Q" * 1000, mtime=FIXED)
     dest = tmp_path / "pulled.txt"
@@ -208,10 +268,6 @@ def test_pull_failure_injection_surfaces_nonzero_exit(harness, tmp_path):
     assert result.returncode != 0
 
 
-@pytest.mark.xfail(
-    reason="failed push leaves a fresh-mtime partial destination and the retry is "
-    "skipped; transfer work will fix (check results/sizes so retries are not falsely skipped)"
-)
 def test_push_retry_after_failure_is_not_falsely_skipped(harness, tmp_path):
     src = write_tree(tmp_path / "host", {"f.txt": b"R" * 1000}) / "f.txt"
     os.utime(src, (FIXED, FIXED))
@@ -229,21 +285,20 @@ def test_push_retry_after_failure_is_not_falsely_skipped(harness, tmp_path):
     assert dest.read_bytes() == b"R" * 1000
 
 
-@pytest.mark.xfail(
-    reason="diff compares minute-truncated mtimes only; a size change within the "
-    "same minute is skipped — metadata work will fix"
-)
 def test_push_same_minute_size_change_is_detected(harness, tmp_path):
+    # Trailing slash on both runs: rerun-sensitive test (see tests/README.md);
+    # without it the second run would nest a fresh host/ directory and never
+    # recompare f.txt against the same destination.
     src = write_tree(tmp_path / "host", {"f.txt": b"original"})
     os.utime(src, (FIXED, FIXED))
-    harness.run_adbsync("push", str(src), "/sdcard/dest", expect=0)
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest", expect=0)
 
-    # Same mtime, different size: the current planner cannot see this change.
+    # Same mtime, different size: only a size-aware diff can see this change.
     (src / "f.txt").write_bytes(b"completely different and longer content")
     os.utime(src / "f.txt", (FIXED, FIXED))
 
     harness.reset_log()
-    harness.run_adbsync("push", str(src), "/sdcard/dest", expect=0)
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest", expect=0)
 
     dest = harness.device_path("sdcard/dest/f.txt")
     assert dest.read_bytes() == b"completely different and longer content"
@@ -301,7 +356,8 @@ def test_pull_into_missing_destination_directory(harness, tmp_path):
 
     assert (dest / "a.txt").read_bytes() == b"a"
     assert (dest / "sub" / "b.txt").read_bytes() == b"b"
-    assert harness.log.count_transfers("pull") == 2
+    # Missing destination + default options: one recursive adb pull.
+    assert harness.log.count_transfers("pull") == 1
 
 
 def test_pull_nested_tree_content_parity(harness, tmp_path):
@@ -313,7 +369,8 @@ def test_pull_nested_tree_content_parity(harness, tmp_path):
     harness.run_adbsync("pull", "/sdcard/tree", str(dest), expect=0)
 
     assert tree_digest(dest) == tree_digest(harness.device_path("sdcard/tree"))
-    assert harness.log.count_transfers("pull") == 4
+    # Missing destination + default options: one recursive adb pull.
+    assert harness.log.count_transfers("pull") == 1
 
 
 def test_pull_filenames_with_spaces_and_unicode(harness, tmp_path):
@@ -331,7 +388,8 @@ def test_pull_filenames_with_spaces_and_unicode(harness, tmp_path):
     harness.run_adbsync("pull", "/sdcard/src", str(dest), expect=0)
 
     assert tree_digest(dest) == tree_digest(harness.device_path("sdcard/src"))
-    assert harness.log.count_transfers("pull") == len(spec)
+    # Missing destination + default options: one recursive adb pull.
+    assert harness.log.count_transfers("pull") == 1
 
 
 def test_pull_trailing_slash_merges_into_existing_directory(harness, tmp_path):
@@ -395,7 +453,8 @@ def test_pull_empty_directory_tree(harness, tmp_path):
 
     assert dest.is_dir()
     assert (dest / "empty").is_dir()
-    assert harness.log.count_transfers("pull") == 0
+    # Empty trees still take the recursive fast path (one adb pull, no files).
+    assert harness.log.count_transfers("pull") == 1
 
 
 def test_pull_missing_source_fails(harness, tmp_path):

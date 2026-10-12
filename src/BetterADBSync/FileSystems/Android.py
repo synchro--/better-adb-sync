@@ -1,5 +1,5 @@
 import errno
-from typing import Iterable, Iterator, List, NoReturn, Tuple
+from typing import Dict, Iterable, Iterator, List, NoReturn, Tuple
 import logging
 import os
 import re
@@ -11,7 +11,7 @@ import subprocess
 from .date_utils import datetime_string_to_posix_timestamp
 from ..SAOLogging import logging_fatal
 
-from .Base import FileSystem
+from .Base import FileSystem, chunk_arguments
 
 
 class AndroidFileSystem(FileSystem):
@@ -182,6 +182,12 @@ class AndroidFileSystem(FileSystem):
         for line in self.adb_shell(["mkdir", "-p", path]):
             self.line_not_captured(line)
 
+    def makedirs_many(self, paths: List[str]) -> None:
+        overhead = self._command_overhead_bytes(["mkdir", "-p"])
+        for chunk in chunk_arguments(paths, overhead_bytes = overhead):
+            for line in self.adb_shell(["mkdir", "-p"] + chunk):
+                self.line_not_captured(line)
+
     def realpath(self, path: str) -> str:
         for line in self.adb_shell(["realpath", path]):
             if self.RE_REALPATH_NO_SUCH_FILE.fullmatch(line):
@@ -205,12 +211,30 @@ class AndroidFileSystem(FileSystem):
             else:
                 yield self.ls_to_stat(line)
 
-    def utime(self, path: str, times: Tuple[int, int]) -> None:
+    @staticmethod
+    def _format_touch_times(times: Tuple[int, int]) -> Tuple[str, str]:
         base = datetime.datetime(1970, 1, 1)
         atime = (base + datetime.timedelta(seconds=times[0])).strftime("%Y%m%d%H%M")
         mtime = (base + datetime.timedelta(seconds=times[1])).strftime("%Y%m%d%H%M")
+        return atime, mtime
+
+    def utime(self, path: str, times: Tuple[int, int]) -> None:
+        atime, mtime = self._format_touch_times(times)
         for line in self.adb_shell(["touch", "-at", atime, "-mt", mtime, path]):
             self.line_not_captured(line)
+
+    def utime_many(self, entries: List[Tuple[str, Tuple[int, int]]]) -> None:
+        # Group by identical timestamps so one touch can stamp many paths.
+        paths_by_times: Dict[Tuple[int, int], List[str]] = {}
+        for path, times in entries:
+            paths_by_times.setdefault(times, []).append(path)
+        for times, paths in paths_by_times.items():
+            atime, mtime = self._format_touch_times(times)
+            fixed = ["touch", "-at", atime, "-mt", mtime]
+            overhead = self._command_overhead_bytes(fixed)
+            for chunk in chunk_arguments(paths, overhead_bytes = overhead):
+                for line in self.adb_shell(fixed + chunk):
+                    self.line_not_captured(line)
 
     def join(self, base: str, leaf: str) -> str:
         if base is None:
@@ -227,12 +251,29 @@ class AndroidFileSystem(FileSystem):
         return os.path.normpath(path).replace("\\", "/")
 
     def push_file_here(self, source: str, destination: str, show_progress: bool = False) -> None:
-        if show_progress:
-            kwargs_call = {}
-        else:
-            kwargs_call = {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL
-            }
-        if subprocess.call(self.adb_arguments + ["push", source, destination], **kwargs_call):
-            logging_fatal("Non-zero exit code from adb push")
+        self._run_transfer_command(
+            self.adb_arguments + ["push", source, destination],
+            "push",
+            f"{source} -> {destination}",
+            show_progress = show_progress
+        )
+
+    def push_files_here(self, sources: List[str], destination_dir: str, show_progress: bool = False) -> None:
+        overhead = self._command_overhead_bytes(["push", destination_dir])
+        for chunk in chunk_arguments(sources, overhead_bytes = overhead):
+            self._run_transfer_command(
+                self.adb_arguments + ["push"] + chunk + [destination_dir],
+                "push",
+                f"{len(chunk)} file(s) into {destination_dir} (first: {chunk[0]})",
+                show_progress = show_progress
+            )
+
+    def push_recursive_here(self, source: str, destination: str, show_progress: bool = False) -> None:
+        # adb push preserves source modification times natively, matching the
+        # timestamp policy of the classic path without any post-copy touch.
+        self._run_transfer_command(
+            self.adb_arguments + ["push", source, destination],
+            "push",
+            f"recursive copy of {source} -> {destination}",
+            show_progress = show_progress
+        )

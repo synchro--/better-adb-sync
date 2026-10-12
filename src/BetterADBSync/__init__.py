@@ -8,11 +8,12 @@ import importlib.metadata
 import logging
 import os
 import stat
+import time
 from typing import List, Tuple, Union
 
 from BetterADBSync import adb
 from .FileSystems.Android import AndroidFileSystem
-from .FileSystems.Base import FileSystem
+from .FileSystems.Base import FileSystem, tree_file_size
 from .FileSystems.Local import LocalFileSystem
 from .SAOLogging import logging_fatal, log_tree, setup_root_logger, perror, pfatal
 from .argparsing import get_cli_args
@@ -114,7 +115,16 @@ class FileSyncer:
                     unaccounted_destination = None
                     excluded_destination = destination
                 else:
-                    if source[1] > destination[1]:
+                    # Copy when the source is newer (existing conflict rule) or
+                    # when sizes differ; the latter catches same-minute content
+                    # changes and partial destinations left by failed transfers.
+                    source_size = tree_file_size(source)
+                    destination_size = tree_file_size(destination)
+                    if source[1] > destination[1] or (
+                        source_size is not None
+                        and destination_size is not None
+                        and source_size != destination_size
+                    ):
                         delete = destination
                         copy = source
                         excluded_source = None
@@ -329,6 +339,101 @@ class FileSyncer:
             )
         return path_source, path_destination
 
+def _tree_file_stats(tree) -> Tuple[int, int]:
+    """(file count, total bytes) over all file leaves of a tree."""
+    if tree is None:
+        return 0, 0
+    if isinstance(tree, tuple):
+        return 1, tree_file_size(tree) or 0
+    files = 0
+    total_bytes = 0
+    for key, value in tree.items():
+        if key == ".":
+            continue
+        child_files, child_bytes = _tree_file_stats(value)
+        files += child_files
+        total_bytes += child_bytes
+    return files, total_bytes
+
+def _default_transfer_options(args) -> bool:
+    """True when no option requires the classic planner/executor.
+
+    The fast paths (one recursive transfer, batched transfers) reproduce the
+    default behavior exactly; any advanced option falls back to the classic
+    code paths so its semantics stay byte-for-byte identical.
+    """
+    return not (
+        args.dry_run
+        or args.copy_links
+        or args.exclude
+        or args.exclude_from
+        or args.delete
+        or args.delete_excluded
+        or args.force
+        or args.skip_permission_denied
+    )
+
+def _walk_local_tree(root: str) -> Union[Tuple[int, int], None]:
+    """(file count, total bytes) of a local tree, or None if it contains any symlink.
+
+    The classic planner ignores symlinks (unless -L), so a tree containing
+    symlinks is not eligible for the recursive fast path.
+    """
+    files = 0
+    total_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks = False):
+        for name in dirnames:
+            if os.path.islink(os.path.join(dirpath, name)):
+                return None
+        for name in filenames:
+            full_path = os.path.join(dirpath, name)
+            if os.path.islink(full_path):
+                return None
+            files += 1
+            try:
+                total_bytes += os.lstat(full_path).st_size
+            except OSError:
+                return None
+    return files, total_bytes
+
+def _try_recursive_fast_path(args, fs_source: FileSystem, path_source: str,
+    fs_destination: FileSystem, path_destination: str) -> Union[Tuple[int, int], None]:
+    """Copy a whole directory tree with ONE recursive adb push/pull when eligible.
+
+    Eligibility (all verified here): default options, source is a real
+    directory (not a symlink), destination root is missing (already mapped by
+    paths_to_fixed_destination_paths, so trailing-slash/layout semantics match
+    the classic path), and for push the local source tree contains no
+    symlinks. Returns (files copied, bytes copied) when the fast path ran,
+    None to fall back to the classic planner.
+    """
+    try:
+        lstat_source = fs_source.lstat(path_source)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return None
+    if not stat.S_ISDIR(lstat_source.st_mode) or stat.S_ISLNK(lstat_source.st_mode):
+        return None
+    try:
+        fs_destination.lstat(path_destination)
+        return None # destination exists: the classic planner must diff against it
+    except FileNotFoundError:
+        pass
+    except (NotADirectoryError, PermissionError):
+        return None
+
+    if args.direction == "push":
+        # Local walks are cheap and double as the summary's file/byte counts.
+        walk_result = _walk_local_tree(path_source)
+        if walk_result is None:
+            return None
+        files_copied, bytes_copied = walk_result
+    fs_destination.push_recursive_here(path_source, path_destination, show_progress = args.show_progress)
+    if args.direction == "pull":
+        # Count what actually arrived (no remote inventory is needed).
+        files_copied, bytes_copied = _walk_local_tree(path_destination) or (0, 0)
+    logging.info(f"Copied {path_source} --> {path_destination} with one recursive adb {args.direction}")
+    return files_copied, bytes_copied
+
 def main():
     args = get_cli_args(__doc__, __version__)
 
@@ -342,6 +447,8 @@ def main():
         from .completion import run_completion_command
         raise SystemExit(run_completion_command(args))
     # --- END SHELL COMPLETION DISPATCH --------------------------------------
+
+    started = time.perf_counter()
 
     setup_root_logger(
         no_color = args.logging_no_color,
@@ -387,10 +494,23 @@ def main():
     path_source = fs_source.normpath(path_source)
     path_destination = fs_destination.normpath(path_destination)
 
+    # Fast path: a directory source and a brand-new destination can be copied
+    # with a single recursive adb push/pull, skipping both full-tree builds.
+    if _default_transfer_options(args):
+        fast_result = _try_recursive_fast_path(args, fs_source, path_source, fs_destination, path_destination)
+        if fast_result is not None:
+            files_copied, bytes_copied = fast_result
+            elapsed = time.perf_counter() - started
+            logging.info(f"Summary: copied {files_copied} files ({bytes_copied} bytes); "
+                         f"0 skipped; 0 failed; elapsed {elapsed:.2f}s")
+            return
+
     try:
         files_tree_source = fs_source.get_files_tree(path_source, follow_links = args.copy_links)
     except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
         pfatal(path_source, e)
+
+    total_source_files, _ = _tree_file_stats(files_tree_source)
 
     try:
         files_tree_destination = fs_destination.get_files_tree(path_destination, follow_links = args.copy_links)
@@ -399,15 +519,19 @@ def main():
     except (NotADirectoryError, PermissionError) as e:
         pfatal(path_destination, e)
 
-    logging.info("Source tree:")
-    if files_tree_source is not None:
-        log_tree(path_source, files_tree_source)
-    logging.info("")
+    # Full tree dumps and per-file operation lines are part of the plan
+    # display: shown for dry runs and verbose runs only, never by default.
+    plan_log_level = logging.INFO if (args.dry_run or args.logging_verbosity_verbose > 0) else logging.DEBUG
 
-    logging.info("Destination tree:")
+    logging.log(plan_log_level, "Source tree:")
+    if files_tree_source is not None:
+        log_tree(path_source, files_tree_source, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
+
+    logging.log(plan_log_level, "Destination tree:")
     if files_tree_destination is not None:
-        log_tree(path_destination, files_tree_destination)
-    logging.info("")
+        log_tree(path_destination, files_tree_destination, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
 
     if isinstance(files_tree_source, dict):
         exclude_patterns = [fs_destination.normpath(
@@ -438,36 +562,38 @@ def main():
     tree_unaccounted_destination = FileSyncer.prune_tree(tree_unaccounted_destination)
     tree_excluded_destination    = FileSyncer.prune_tree(tree_excluded_destination)
 
-    tree_delete                  = FileSyncer.sort_tree(tree_delete)
-    tree_copy                    = FileSyncer.sort_tree(tree_copy)
-    tree_excluded_source         = FileSyncer.sort_tree(tree_excluded_source)
-    tree_unaccounted_destination = FileSyncer.sort_tree(tree_unaccounted_destination)
-    tree_excluded_destination    = FileSyncer.sort_tree(tree_excluded_destination)
+    if plan_log_level == logging.INFO:
+        # Sorting whole trees is only worth its cost when the plan is displayed.
+        tree_delete                  = FileSyncer.sort_tree(tree_delete)
+        tree_copy                    = FileSyncer.sort_tree(tree_copy)
+        tree_excluded_source         = FileSyncer.sort_tree(tree_excluded_source)
+        tree_unaccounted_destination = FileSyncer.sort_tree(tree_unaccounted_destination)
+        tree_excluded_destination    = FileSyncer.sort_tree(tree_excluded_destination)
 
-    logging.info("Delete tree:")
+    logging.log(plan_log_level, "Delete tree:")
     if tree_delete is not None:
-        log_tree(path_destination, tree_delete, log_leaves_types = False)
-    logging.info("")
+        log_tree(path_destination, tree_delete, log_leaves_types = False, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
 
-    logging.info("Copy tree:")
+    logging.log(plan_log_level, "Copy tree:")
     if tree_copy is not None:
-        log_tree(f"{path_source} --> {path_destination}", tree_copy, log_leaves_types = False)
-    logging.info("")
+        log_tree(f"{path_source} --> {path_destination}", tree_copy, log_leaves_types = False, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
 
-    logging.info("Source excluded tree:")
+    logging.log(plan_log_level, "Source excluded tree:")
     if tree_excluded_source is not None:
-        log_tree(path_source, tree_excluded_source, log_leaves_types = False)
-    logging.info("")
+        log_tree(path_source, tree_excluded_source, log_leaves_types = False, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
 
-    logging.info("Destination unaccounted tree:")
+    logging.log(plan_log_level, "Destination unaccounted tree:")
     if tree_unaccounted_destination is not None:
-        log_tree(path_destination, tree_unaccounted_destination, log_leaves_types = False)
-    logging.info("")
+        log_tree(path_destination, tree_unaccounted_destination, log_leaves_types = False, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
 
-    logging.info("Destination excluded tree:")
+    logging.log(plan_log_level, "Destination excluded tree:")
     if tree_excluded_destination is not None:
-        log_tree(path_destination, tree_excluded_destination, log_leaves_types = False)
-    logging.info("")
+        log_tree(path_destination, tree_excluded_destination, log_leaves_types = False, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
 
     if len(fs_source.permission_denied_skipped) > 0:
         logging.warning("Source elements skipped because of permission denied error:")
@@ -484,10 +610,10 @@ def main():
             )
         )
 
-    logging.info("Non-excluded-supporting destination unaccounted tree:")
+    logging.log(plan_log_level, "Non-excluded-supporting destination unaccounted tree:")
     if tree_unaccounted_destination_non_excluded is not None:
-        log_tree(path_destination, tree_unaccounted_destination_non_excluded, log_leaves_types = False)
-    logging.info("")
+        log_tree(path_destination, tree_unaccounted_destination_non_excluded, log_leaves_types = False, logging_level = plan_log_level)
+    logging.log(plan_log_level, "")
 
     logging.info("SYNCING")
     logging.info("")
@@ -527,20 +653,42 @@ def main():
             logging.info("Empty non-excluded-supporting destination unaccounted tree")
         logging.info("")
 
+    files_copied = 0
+    bytes_copied = 0
+    files_planned, bytes_planned = _tree_file_stats(tree_copy)
+
     if tree_copy is not None:
         logging.info("Copying copy tree")
-        fs_destination.push_tree_here(
-            path_source,
-            fs_destination.split(path_source)[1] if isinstance(tree_copy, tuple) else ".",
-            tree_copy,
-            path_destination,
-            fs_source,
-            dry_run = args.dry_run,
-            show_progress = args.show_progress
-        )
+        if not args.dry_run and isinstance(tree_copy, dict) and _default_transfer_options(args):
+            files_copied, bytes_copied = fs_destination.push_tree_here_batched(
+                path_source,
+                tree_copy,
+                path_destination,
+                fs_source,
+                show_progress = args.show_progress
+            )
+        else:
+            files_copied, bytes_copied = fs_destination.push_tree_here(
+                path_source,
+                fs_destination.split(path_source)[1] if isinstance(tree_copy, tuple) else ".",
+                tree_copy,
+                path_destination,
+                fs_source,
+                dry_run = args.dry_run,
+                show_progress = args.show_progress
+            )
     else:
         logging.info("Empty copy tree")
     logging.info("")
+
+    files_skipped = max(total_source_files - files_planned, 0)
+    elapsed = time.perf_counter() - started
+    if args.dry_run:
+        logging.info(f"Dry run summary: would copy {files_planned} files ({bytes_planned} bytes); "
+                     f"{files_skipped} skipped; elapsed {elapsed:.2f}s")
+    else:
+        logging.info(f"Summary: copied {files_copied} files ({bytes_copied} bytes); "
+                     f"{files_skipped} skipped; 0 failed; elapsed {elapsed:.2f}s")
 
 if __name__ == "__main__":
     main()

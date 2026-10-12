@@ -162,9 +162,9 @@ def test_get_files_tree_round_trip(fs, harness):
     assert set(tree) == {".", "a.txt", "with space.txt", "日本語 ファイル.txt", "sub"}
     assert set(tree["sub"]) == {".", "b.txt", "deep"}
     assert set(tree["sub"]["deep"]) == {".", "c.txt"}
-    # Base.py stores minute-truncated (atime, mtime) tuples.
+    # Base.py stores minute-truncated (atime, mtime, size) tuples for files.
     expected_minute = FIXED_MTIME - (FIXED_MTIME % 60)
-    assert tree["a.txt"] == (expected_minute, expected_minute)
+    assert tree["a.txt"] == (expected_minute, expected_minute, 1)
 
 
 def test_missing_path_error_kinds(fs, harness):

@@ -19,7 +19,7 @@ tests/
   fake_adb.py                 # executable ADB shim (shebang + +x); no real ADB calls
   test_fake_adb.py            # fake protocol/command contract (keep green first)
   test_transfer.py            # push/pull behavior of the current implementation
-  test_performance_counts.py  # adb process-count baseline + xfail budgets
+  test_performance_counts.py  # adb process-count budgets (fast path + batching)
   test_completion.py          # shell completion tests (owned by the completion work)
 benchmarks/
   measure.py                  # synthetic benchmark harness (fake adb only)
@@ -109,7 +109,7 @@ fish --no-execute completions/adbsync.fish
 * Rerun-sensitive tests push with a **trailing slash** on the source (or to a
   full destination file path) so that adbsync's trailing-slash semantics don't
   make the second run nest a fresh directory and recopy everything.
-* Known current-behavior gaps are asserted as `xfail` with an explicit reason
-  (pull exit code not checked; retries falsely skipped after a failed push;
-  same-minute size changes invisible to the mtime-only diff) so the transfer
-  work can flip them.
+* Former current-behavior gaps (pull exit code not checked; retries falsely
+  skipped after a failed push; same-minute size changes invisible to the
+  mtime-only diff) were flipped from `xfail` to ordinary passing assertions
+  by the transfer work.
