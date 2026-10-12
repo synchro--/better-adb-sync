@@ -32,7 +32,19 @@ class Args:
     direction_pull_android: Optional[str]
     direction_pull_local: Optional[str]
 
-def get_cli_args(docstring: str, version: str) -> Args:
+    # Shell completion subcommands. `direction_completion_shell` is set by the
+    # visible `completion` subcommand (one of bash/zsh/fish);
+    # `completion_remote_paths_dir` is set by the hidden `completion-remote-paths`
+    # helper used by the generated shell completion scripts for remote paths.
+    direction_completion_shell: Optional[str] = None
+    completion_remote_paths_dir: Optional[str] = None
+
+def build_parser(docstring: str, version: str) -> argparse.ArgumentParser:
+    """Build the full adbsync argument parser without parsing any arguments.
+
+    Kept separate from get_cli_args() so the shell-completion generator can
+    derive subcommands/options from the single source of truth.
+    """
     help_text = '''
     Better ADB Sync - Get latest version from https://github.com/jpstotz/better-adb-sync
     '''
@@ -170,6 +182,32 @@ def get_cli_args(docstring: str, version: str) -> Args:
         help = "Local path"
     )
 
+    parser_direction_completion = parser_direction.add_parser("completion",
+        help = "Print a shell completion script (bash, zsh or fish) to stdout"
+    )
+    parser_direction_completion.add_argument("direction_completion_shell",
+        metavar = "SHELL",
+        choices = ["bash", "zsh", "fish"],
+        help = "Which shell's completion script to print"
+    )
+
+    # Internal helper used by the generated shell completion scripts to list the
+    # immediate children of a remote (Android) directory. It takes no `help`
+    # text so argparse never lists it under `direction` (it still appears in
+    # the usage braces; that is an argparse limitation). completion.py must
+    # never hang a shell, so it enforces a short timeout and prints nothing /
+    # exits 0 on any error.
+    parser_direction_completion_remote_paths = parser_direction.add_parser("completion-remote-paths")
+    parser_direction_completion_remote_paths.add_argument("completion_remote_paths_dir",
+        metavar = "DIR",
+        help = argparse.SUPPRESS
+    )
+
+    return parser
+
+def get_cli_args(docstring: str, version: str) -> Args:
+    parser = build_parser(docstring, version)
+
     args = parser.parse_args()
 
     if args.direction == "push":
@@ -179,12 +217,20 @@ def get_cli_args(docstring: str, version: str) -> Args:
             None,
             None
         )
-    else:
+    elif args.direction == "pull":
         args_direction_ = (
             None,
             None,
             args.direction_pull_android,
             args.direction_pull_local
+        )
+    else:
+        # completion / completion-remote-paths carry no LOCAL/ANDROID paths
+        args_direction_ = (
+            None,
+            None,
+            None,
+            None
         )
 
     args = Args(
@@ -208,7 +254,10 @@ def get_cli_args(docstring: str, version: str) -> Args:
         args.adb_options,
 
         args.direction,
-        *args_direction_
+        *args_direction_,
+
+        getattr(args, "direction_completion_shell", None),
+        getattr(args, "completion_remote_paths_dir", None)
     )
 
     return args

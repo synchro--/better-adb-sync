@@ -332,6 +332,17 @@ class FileSyncer:
 def main():
     args = get_cli_args(__doc__, __version__)
 
+    # --- SHELL COMPLETION DISPATCH (keep this block intact) -----------------
+    # `adbsync completion <shell>` prints a completion script to stdout and
+    # exits before any ADB/device interaction. The internal helper
+    # `adbsync completion-remote-paths DIR` (hidden from --help) lists the
+    # immediate children of a remote directory for the generated completion
+    # scripts; it enforces its own short timeout so it can never hang a shell.
+    if args.direction in ("completion", "completion-remote-paths"):
+        from .completion import run_completion_command
+        raise SystemExit(run_completion_command(args))
+    # --- END SHELL COMPLETION DISPATCH --------------------------------------
+
     setup_root_logger(
         no_color = args.logging_no_color,
         verbosity_level = args.logging_verbosity_verbose,

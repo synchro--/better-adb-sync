@@ -34,7 +34,7 @@ Full help is available with `$ adbsync --help`:
 adbsync --help
 usage: adbsync [-h] [--version] [--no-color] [-v | -q] [-n] [-L] [--exclude EXCLUDE] [--exclude-from EXCLUDE_FROM] [--del] [--delete-excluded] [--force] [--show-progress]
                [--adb-encoding ADB_ENCODING] [--adb-bin ADB_BIN] [--adb-flag ADB_FLAG] [--adb-option OPTION VALUE]
-               {push,pull} ...
+               {push,pull,completion,completion-remote-paths} ...
 
 Sync files between a computer and an Android device
 
@@ -67,9 +67,78 @@ ADB arguments:
                         Add an option to call adb with, eg '--adb-option P 5037' for adb -P 5037, that is use port 5037 for the adb server
 
 direction:
-  {push,pull}
+  {push,pull,completion,completion-remote-paths}
     push                Push from computer to phone
     pull                Pull from phone to computer
+    completion          Print a shell completion script (bash, zsh or fish) to
+                        stdout
+```
+
+## Shell completion
+
+Tab completion for **Bash, Zsh and Fish** covers the subcommands (`push`,
+`pull`, `completion`), all long/short options and flags, local path arguments,
+and remote (Android) path arguments.
+
+Completion is strictly opt-in: **adbsync never modifies your shell startup
+files automatically**. You choose whether and how to enable it — the scripts
+are only printed by `adbsync completion <shell>`.
+
+### Bash
+
+Add this to your `~/.bashrc`:
+
+```bash
+source <(adbsync completion bash)
+```
+
+Alternatively, save the script where your bash-completion setup finds it:
+
+```bash
+adbsync completion bash > ~/.local/share/bash-completion/completions/adbsync
+```
+
+### Zsh
+
+Save the script as `_adbsync` in a directory on your `fpath` (this must happen
+before `compinit` runs, e.g. from `~/.zshrc`):
+
+```zsh
+adbsync completion zsh > "${fpath[1]}/_adbsync"
+```
+
+Or source it directly from `~/.zshrc`:
+
+```zsh
+source <(adbsync completion zsh)
+```
+
+### Fish
+
+```fish
+adbsync completion fish > ~/.config/fish/completions/adbsync.fish
+```
+
+Fish loads completions from that directory automatically.
+
+### What gets completed
+
+- Local path arguments use your shell's native file completion.
+- Remote (Android) path arguments list the **immediate children** of the
+  remote parent directory only (never a recursive scan). Directories are
+  suggested with a trailing `/`. The query honors `--adb-bin`, `--adb-flag`
+  and `--adb-option` if you have typed them already, enforces an internal
+  timeout of about one second, and suggests nothing when no device is
+  connected — completion can never hang your shell.
+
+The scripts in [`completions/`](completions/) are checked-in snapshots of
+`adbsync completion <shell>`; the test suite verifies they are up to date.
+After changing the CLI, regenerate them with:
+
+```sh
+adbsync completion bash > completions/adbsync.bash
+adbsync completion zsh  > completions/_adbsync
+adbsync completion fish > completions/adbsync.fish
 ```
 
 ## Intro
