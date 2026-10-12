@@ -4,6 +4,7 @@ These tests exercise the fake adb directly (and through the product's real
 AndroidFileSystem class) so that later transfer tests can rely on it.
 """
 
+import calendar
 import os
 import shlex
 import shutil
@@ -16,7 +17,7 @@ import pytest
 
 from BetterADBSync.FileSystems.Android import AndroidFileSystem
 
-from conftest import FAKE_ADB, tree_digest, write_tree
+from conftest import FAKE_ADB, device_write, tree_digest, write_tree
 
 SENTINEL = "ADBSYNC END OF COMMAND"
 MINUTE = 60
@@ -464,3 +465,68 @@ def test_fake_never_needs_a_real_adb_on_path(harness, tmp_path):
     result = harness.run_fake("push", str(host / "f.txt"), "/sdcard/f.txt")
     assert result.returncode == 0, result.stderr
     assert harness.device_path("sdcard/f.txt").read_bytes() == b"no-adb-needed"
+
+
+# --- timezone modelling (BETTER_ADBSYNC_FAKE_TZ_OFFSET) --------------------
+
+
+def test_date_percent_z_reports_configured_utc_offset(harness):
+    result = harness.run_fake("shell", "date", "+%z")
+    assert result.returncode == 0
+    assert result.stdout.strip() == "+0000"
+
+    harness.set_tz_offset("+0100")
+    result = harness.run_fake("shell", "date", "+%z")
+    assert result.returncode == 0
+    assert result.stdout.strip() == "+0100"
+
+
+def test_date_rejects_invalid_offset_configuration(harness):
+    harness.set_tz_offset("0100")  # missing sign
+    result = harness.run_fake("shell", "date", "+%z")
+    assert result.returncode == 2
+    assert "expected +HHMM" in result.stderr
+
+
+def test_ls_renders_mtime_as_device_local_wall_clock(harness):
+    device_write(harness, "/sdcard/tz/f.txt", b"x", mtime=FIXED_MTIME)
+
+    harness.set_tz_offset("+0100")
+    result = harness.run_fake("shell", "ls", "-lab", "/sdcard/tz")
+    assert result.returncode == 0
+    tm = time.gmtime(FIXED_MTIME + 3600)
+    stamp = "%04d-%02d-%02d %02d:%02d" % (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min)
+    assert stamp in result.stdout
+
+    # Negative offsets shift the other way (e.g. -0530 = UTC-5:30).
+    harness.set_tz_offset("-0530")
+    result = harness.run_fake("shell", "ls", "-lab", "/sdcard/tz")
+    assert result.returncode == 0
+    tm = time.gmtime(FIXED_MTIME - 19800)
+    stamp = "%04d-%02d-%02d %02d:%02d" % (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min)
+    assert stamp in result.stdout
+
+
+def test_touch_stores_utc_interpreted_epoch_despite_offset(harness):
+    device_file = device_write(harness, "/sdcard/tz/f.txt", b"x", mtime=FIXED_MTIME)
+    harness.set_tz_offset("+0100")
+
+    # The same string the product formats from a source epoch (naive UTC).
+    tm = time.gmtime(FIXED_MTIME)
+    stamp = "%04d%02d%02d%02d%02d" % (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min)
+    result = harness.run_fake("shell", "touch", "-mt", stamp, "/sdcard/tz/f.txt")
+    assert result.returncode == 0
+    expected = calendar.timegm(time.strptime(stamp, "%Y%m%d%H%M"))
+    assert device_file.stat().st_mtime == expected
+
+
+def test_android_fs_probes_date_offset_once_before_listings(fs, harness):
+    """The product probes `date +%z` once per run, before any ls iteration."""
+    harness.sdcard  # ensure /sdcard exists
+    fs.test_connection()
+    fs.lstat_in_dir("/sdcard")
+    fs.lstat("/sdcard")
+    fs.lstat_in_dir("/sdcard")  # memoized: no second probe
+
+    dates = harness.log.shell_commands("date")
+    assert len(dates) == 1

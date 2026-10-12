@@ -44,6 +44,7 @@ Default to a summary (counts/bytes copied, skipped, failed, elapsed time). Keep 
 - Check every transfer process result and include direction, path/batch, and useful stderr in failures.
 - Never update destination timestamps after a failed transfer.
 - Extend metadata comparisons to include size plus mtime, with tests for minute-resolution collisions and partial files. Preserve the current source-vs-destination timestamp conflict rule unless an explicit behavior change is approved.
+- Parse device mtimes timezone-correctly: `ls` prints device-local wall clock, but the product parses it as UTC, so on a non-UTC device every parsed mtime carries the device's UTC offset as error (observed: a UTC+1 phone made changed files look one hour in the future, and would make `adb pull -a` fast-path reruns re-copy whole trees). Probe the offset once per run with `date +%z` on the persistent shell, subtract it when parsing `ls` output, and leave `touch` formatting unchanged — real toybox interprets its time string as UTC, i.e. stores the epoch the string denotes. Fall back to offset 0 (old behavior) when the probe fails. Fake ADB models the offset via `BETTER_ADBSYNC_FAKE_TZ_OFFSET`.
 - Batch timestamp restoration where possible; only remove/replace it with ADB-native metadata handling after tests prove equivalent behavior.
 - Do not hash all files by default; that would read every byte on each run.
 

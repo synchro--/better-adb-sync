@@ -135,6 +135,10 @@ class Harness:
     def set_no_device(self, value="1"):
         self.monkeypatch.setenv("BETTER_ADBSYNC_FAKE_NO_DEVICE", value)
 
+    def set_tz_offset(self, value):
+        """Model a device whose timezone is not UTC (date +%z format)."""
+        self.monkeypatch.setenv("BETTER_ADBSYNC_FAKE_TZ_OFFSET", value)
+
     def run_fake(self, *args, input=None, timeout=60):
         """Invoke the fake adb directly (as a fresh process)."""
         return subprocess.run(
@@ -194,6 +198,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setenv("BETTER_ADBSYNC_FAKE_LOCAL_ROOT", str(tmp_path))
     monkeypatch.delenv("BETTER_ADBSYNC_FAKE_FAIL", raising=False)
     monkeypatch.delenv("BETTER_ADBSYNC_FAKE_NO_DEVICE", raising=False)
+    monkeypatch.delenv("BETTER_ADBSYNC_FAKE_TZ_OFFSET", raising=False)
     return Harness(tmp_path, root, log_path, monkeypatch)
 
 

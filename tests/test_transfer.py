@@ -462,3 +462,77 @@ def test_pull_missing_source_fails(harness, tmp_path):
     assert result.returncode != 0
     assert "/sdcard/nope.txt" in result.stderr
     assert not (tmp_path / "out.txt").exists()
+
+
+# --- non-UTC device (BETTER_ADBSYNC_FAKE_TZ_OFFSET) ------------------------
+#
+# Real devices print `ls` mtimes as device-local wall clock; the product must
+# subtract the offset reported by `date +%z` to recover true epochs. These
+# tests regress two bugs observed against a UTC+1 phone: an incremental push
+# silently skipped changed files whose mtime bump was smaller than the device
+# offset, and a pull fast-path rerun (`pull -a` stores true epochs locally)
+# re-copied the entire tree on every run.
+
+
+def test_push_detects_mtime_only_change_smaller_than_device_offset(harness, tmp_path):
+    harness.set_tz_offset("+0100")
+    src = write_tree(tmp_path / "host", {"f.txt": b"same-size-content"}) / "f.txt"
+    os.utime(src, (FIXED, FIXED))
+    harness.run_adbsync("push", str(src), "/sdcard/dest/f.txt", expect=0)
+    dest = harness.device_path("sdcard/dest/f.txt")
+    assert dest.stat().st_mtime == FIXED_MINUTE
+
+    # +600 s is smaller than the +3600 s device offset; content/size unchanged.
+    os.utime(src, (FIXED + 600, FIXED + 600))
+
+    harness.reset_log()
+    harness.run_adbsync("push", str(src), "/sdcard/dest/f.txt", expect=0)
+    assert harness.log.count_transfers("push") == 1
+    assert dest.stat().st_mtime == FIXED_MINUTE + 600
+
+
+def test_pull_fast_path_rerun_with_non_utc_device_is_noop(harness, tmp_path):
+    harness.set_tz_offset("+0100")
+    device_write(harness, "/sdcard/tree/f.txt", b"data", mtime=FIXED)
+
+    # Trailing slash: merge layout, so the rerun diffs instead of nesting
+    # the tree under the now-existing destination (cp-like semantics).
+    dest = tmp_path / "dest"
+    harness.run_adbsync("pull", "/sdcard/tree/", str(dest), expect=0)
+    # The fast path `pull -a` stores the device's true epoch locally.
+    assert (dest / "f.txt").stat().st_mtime == FIXED
+
+    harness.reset_log()
+    harness.run_adbsync("pull", "/sdcard/tree/", str(dest), expect=0)
+    assert harness.log.count_transfers("pull") == 0
+
+
+def test_push_noop_rerun_with_non_utc_device_is_stable(harness, tmp_path):
+    harness.set_tz_offset("+0100")
+    src = write_tree(tmp_path / "host", {"f.txt": b"stable"}) / "f.txt"
+    os.utime(src, (FIXED, FIXED))
+    harness.run_adbsync("push", str(src), "/sdcard/dest/f.txt", expect=0)
+
+    harness.reset_log()
+    harness.run_adbsync("push", str(src), "/sdcard/dest/f.txt", expect=0)
+    assert harness.log.count_transfers("push") == 0
+
+
+def test_push_roundtrip_mtime_matches_source_on_non_utc_device(harness, tmp_path):
+    harness.set_tz_offset("+0100")
+    src = write_tree(tmp_path / "host", {"f.txt": b"rt"}) / "f.txt"
+    os.utime(src, (FIXED, FIXED))
+    harness.run_adbsync("push", str(src), "/sdcard/dest/f.txt", expect=0)
+    dest = harness.device_path("sdcard/dest/f.txt")
+    assert dest.stat().st_mtime == FIXED_MINUTE
+
+
+def test_pull_classic_rerun_with_non_utc_device_is_noop(harness, tmp_path):
+    harness.set_tz_offset("+0100")
+    device_write(harness, "/sdcard/f.txt", b"data", mtime=FIXED)
+    dest = tmp_path / "dest.txt"
+    harness.run_adbsync("pull", "/sdcard/f.txt", str(dest), expect=0)
+
+    harness.reset_log()
+    harness.run_adbsync("pull", "/sdcard/f.txt", str(dest), expect=0)
+    assert harness.log.count_transfers("pull") == 0

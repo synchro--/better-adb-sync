@@ -68,6 +68,10 @@ class AndroidFileSystem(FileSystem):
     def __init__(self, adb_arguments: List[str], adb_encoding: str, skip_permission_denied: bool) -> None:
         super().__init__(adb_arguments, skip_permission_denied)
         self.adb_encoding = adb_encoding
+        # Device UTC offset in seconds (east of UTC) for timezone-correct ls
+        # parsing; probed once per run by _ensure_utc_offset(). 0 = UTC/unknown.
+        self._utc_offset_seconds = 0
+        self._utc_offset_probed = False
         self.proc_adb_shell = subprocess.Popen(
             self.adb_arguments + ["shell"],
             stdin=subprocess.PIPE,
@@ -106,6 +110,39 @@ class AndroidFileSystem(FileSystem):
         logging.critical("ADB line not captured")
         logging_fatal(line)
 
+    def _ensure_utc_offset(self) -> None:
+        """Probe the device UTC offset once per run (`date +%z`) and cache it.
+
+        `ls` prints mtimes as device-local wall clock while this class parses
+        them as UTC (calendar.timegm), so on a non-UTC device every parsed
+        mtime carries the device's UTC offset as error. The offset is probed
+        once on the persistent shell and subtracted in ls_to_stat. `touch`
+        needs no correction: real toybox interprets its time string as UTC,
+        i.e. stores the epoch the string denotes (verified against the
+        reference device: utime'd files keep their true epoch).
+
+        The probe must not run while another adb_shell iteration is in
+        progress on the shared shell process, so every caller invokes it
+        before starting its own iteration (this method completes the whole
+        command, including reading until the sentinel, before returning).
+
+        A failed or unparsable probe (no `date`, unusual output) leaves the
+        offset at 0, preserving the long-standing UTC behavior.
+        """
+        if self._utc_offset_probed:
+            return
+        offset = 0
+        for line in self.adb_shell(["date", "+%z"]):
+            match = re.fullmatch(r"([+-])(\d{2})(\d{2})", line.strip())
+            if match:
+                sign = 1 if match.group(1) == "+" else -1
+                offset = sign * (int(match.group(2)) * 3600 + int(match.group(3)) * 60)
+                break
+        if offset != 0:
+            logging.info(f"Android device UTC offset: {offset:+d} seconds")
+        self._utc_offset_seconds = offset
+        self._utc_offset_probed = True
+
     def test_connection(self):
         for line in self.adb_shell([":"]):
             print(line)
@@ -115,6 +152,7 @@ class AndroidFileSystem(FileSystem):
                 continue
 
             raise BrokenPipeError
+        self._ensure_utc_offset()
 
     def ls_to_stat(self, line: str) -> Tuple[str | None, os.stat_result]:
         if self.RE_NO_SUCH_FILE.fullmatch(line):
@@ -145,7 +183,11 @@ class AndroidFileSystem(FileSystem):
             if match_groupdict['S_IFSOCK']:
                 st_mode |= stat.S_IFSOCK
             st_size = None if match_groupdict["st_size"] is None else int(match_groupdict["st_size"])
-            st_mtime = int(datetime_string_to_posix_timestamp(match_groupdict["st_mtime"]))
+            # ls shows device-local wall clock; subtract the probed device UTC
+            # offset to recover the true epoch (0 on UTC devices/when unprobed,
+            # preserving the old behavior).
+            st_mtime = int(datetime_string_to_posix_timestamp(
+                match_groupdict["st_mtime"])) - self._utc_offset_seconds
 
             # Fill the rest with dummy values.
             st_ino = 1
@@ -200,11 +242,13 @@ class AndroidFileSystem(FileSystem):
         raise RuntimeError('Android: "realpath" no result')
 
     def lstat(self, path: str) -> os.stat_result:
+        self._ensure_utc_offset()
         for line in self.adb_shell(["ls", "-ladb", path]):
             return self.ls_to_stat(line)[1]
         raise RuntimeError('Android: "ls -ladb" no result')
 
     def lstat_in_dir(self, path: str) -> Iterable[Tuple[str, os.stat_result]]:
+        self._ensure_utc_offset()
         for line in self.adb_shell(["ls", "-lab", path]):
             if self.RE_TOTAL.fullmatch(line):
                 continue

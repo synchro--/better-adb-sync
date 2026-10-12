@@ -44,6 +44,14 @@ Environment variables (the fake-device contract):
 ``BETTER_ADBSYNC_FAKE_LOCAL_ROOT`` (optional)
     When set, local host paths used as push sources or pull destinations
     must resolve beneath it, otherwise the command fails with exit code 1.
+``BETTER_ADBSYNC_FAKE_TZ_OFFSET`` (optional, default ``+0000``)
+    Device UTC offset in ``date +%z`` format (``+HHMM``/``-HHMM``). Models a
+    device whose timezone is not UTC: ``ls`` renders mtimes as device-local
+    wall clock (epoch + offset, printed as-is), ``date +%z`` reports this
+    value, and ``touch`` keeps parsing its time string with
+    ``calendar.timegm`` (matching real toybox, which stores the UTC epoch the
+    string denotes). The product must subtract the offset when parsing ls
+    output to recover true epochs.
 ``BETTER_ADBSYNC_FAKE_NO_DEVICE`` (optional)
     When set to a non-empty value the fake pretends no device is attached:
     ``devices`` lists nothing, ``get-state`` fails and the ``:`` shell test
@@ -58,8 +66,16 @@ Deliberate deviations from real adb (documented in tests/README.md):
   silently paper over a missing/partial transfer.
 * Mode bits are not preserved; push/pull preserve file mtimes (push always,
   pull only with ``-a``; adbsync re-applies mtimes itself afterwards).
-* ls timestamps are formatted in UTC because the product parses them with
-  ``calendar.timegm`` (date_utils.datetime_string_to_posix_timestamp).
+* ls timestamps are rendered in the fake device's timezone: UTC by default,
+  shifted by ``BETTER_ADBSYNC_FAKE_TZ_OFFSET`` to model a non-UTC device.
+  The product parses them with ``calendar.timegm``
+  (date_utils.datetime_string_to_posix_timestamp) and must subtract the
+  device offset to recover the true epoch; with the default offset nothing
+  changes and minute-truncated round trips stay exact.
+* ``touch`` interprets its ``[[CC]YY]MMDDhhmm`` string with
+  ``calendar.timegm`` (UTC wall clock) regardless of the fake timezone --
+  matching real toybox on the reference device, where the stored epoch is
+  the UTC interpretation of the string.
 """
 
 import calendar
@@ -67,6 +83,7 @@ import fnmatch
 import json
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import stat
@@ -82,6 +99,7 @@ ENV_DELAY_MS = "BETTER_ADBSYNC_FAKE_DELAY_MS"
 ENV_FAIL = "BETTER_ADBSYNC_FAKE_FAIL"
 ENV_LOCAL_ROOT = "BETTER_ADBSYNC_FAKE_LOCAL_ROOT"
 ENV_NO_DEVICE = "BETTER_ADBSYNC_FAKE_NO_DEVICE"
+ENV_TZ_OFFSET = "BETTER_ADBSYNC_FAKE_TZ_OFFSET"
 
 # adb global options that consume a separate value.
 GLOBAL_VALUE_OPTS = ("-s", "-t", "-H", "-P", "-L")
@@ -114,6 +132,16 @@ class Stats:
         self.skipped = 0
 
 
+def parse_tz_offset(value):
+    """Parse a `date +%z` style offset (+HHMM/-HHMM) to (string, seconds)."""
+    match = re.fullmatch(r"([+-])(\d{2})(\d{2})", value.strip())
+    if not match:
+        raise ConfigError(f"{ENV_TZ_OFFSET}: expected +HHMM or -HHMM, got {value!r}")
+    sign = 1 if match.group(1) == "+" else -1
+    seconds = sign * (int(match.group(2)) * 3600 + int(match.group(3)) * 60)
+    return f"{match.group(1)}{match.group(2)}{match.group(3)}", seconds
+
+
 class Context:
     def __init__(self, environ):
         self.environ = environ
@@ -129,6 +157,8 @@ class Context:
         self.log_path = environ.get(ENV_LOG)
         self.no_device = bool(environ.get(ENV_NO_DEVICE))
         self.rules = self._parse_fail_spec(environ.get(ENV_FAIL, ""))
+        self.tz_offset_str, self.tz_offset = parse_tz_offset(
+            environ.get(ENV_TZ_OFFSET, "+0000") or "+0000")
 
     @staticmethod
     def _parse_fail_spec(spec):
@@ -283,8 +313,12 @@ def _escape_b(name):
     return "".join(out)
 
 
-def ls_line(display_name, st, escape):
-    """One `ls -l` style line that matches Android.RE_LS_TO_STAT exactly."""
+def ls_line(display_name, st, escape, tz_offset=0):
+    """One `ls -l` style line that matches Android.RE_LS_TO_STAT exactly.
+
+    ``tz_offset`` shifts the rendered mtime into device-local wall clock
+    (seconds east of UTC), modelling a device whose timezone is not UTC.
+    """
     if stat.S_ISDIR(st.st_mode):
         typechar, size_field = "d", str(st.st_size)
     elif stat.S_ISREG(st.st_mode):
@@ -302,7 +336,7 @@ def ls_line(display_name, st, escape):
     else:  # pragma: no cover - not reachable with generated fixtures
         typechar, size_field = "-", str(st.st_size)
 
-    tm = time.gmtime(st.st_mtime)
+    tm = time.gmtime(st.st_mtime + tz_offset)
     stamp = "%04d-%02d-%02d %02d:%02d" % (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min)
     nlink = st.st_nlink if st.st_nlink > 0 else 1
 
@@ -376,7 +410,7 @@ def cmd_ls(tokens, ctx):
             continue
         st = os.lstat(host)
         if (not stat.S_ISDIR(st.st_mode)) or ("d" in flags):
-            lines.append(ls_line(raw, st, escape))
+            lines.append(ls_line(raw, st, escape, ctx.tz_offset))
             continue
         # Directory listing without -d: 'total N' header plus entries.
         try:
@@ -395,7 +429,7 @@ def cmd_ls(tokens, ctx):
                 lines.append(f"ls: {raw}: {e.strerror}")
                 status = 1
                 continue
-            lines.append(ls_line(name, child_st, escape))
+            lines.append(ls_line(name, child_st, escape, ctx.tz_offset))
     return lines, status
 
 
@@ -542,6 +576,13 @@ def cmd_touch(tokens, ctx):
     return lines, status
 
 
+def cmd_date(tokens, ctx):
+    # The product probes the device UTC offset with `date +%z` once per run.
+    if tokens[1:] == ["+%z"]:
+        return [ctx.tz_offset_str], 0
+    return ["date: only the +%z format is supported by fake adb"], 1
+
+
 def execute_shell_command(tokens, ctx):
     """Run one shell command; return (output_lines, exit_status)."""
     if not tokens:
@@ -553,6 +594,8 @@ def execute_shell_command(tokens, ctx):
         return [], 0
     if cmd == "echo":
         return [" ".join(tokens[1:])], 0
+    if cmd == "date":
+        return cmd_date(tokens, ctx)
     if cmd == "ls":
         return cmd_ls(tokens, ctx)
     if cmd == "realpath":
