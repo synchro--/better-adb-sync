@@ -7,8 +7,24 @@ license = "Apache-2.0"
 license-files = [ "LICENSE" ]
 requires-python = ">= 3.10"
 
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project.urls]
 Homepage = "https://github.com/jpstotz/better-adb-sync/"
 
 [project.scripts]
 adbsync = "BetterADBSync:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "performance: asserts on adb process/invocation counts (baseline and post-optimization budgets)",
+    "slow: tests that build larger fixture trees (still safe to run; no device involved)",
+]
