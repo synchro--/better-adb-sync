@@ -110,6 +110,19 @@ total size, decides the win: thousands of small files (caches, thumbnails,
 chat media) improve the most; big media files are USB-bandwidth-bound, so
 the gain there is the removed per-file overhead (~25% on 5 GB of photos).
 
+How it differs from upstream, concretely: upstream walks both trees, then
+for **every file** spawns its own `adb push`/`adb pull` process plus its own
+`touch`/`mkdir` shell round-trips — N files cost N+ processes. This branch
+keeps the same planner and conflict rules, but executes differently: a
+missing destination tree goes over in **one recursive `adb push`/`pull`**
+(the fast path, used for all initial copies); incremental changes are
+grouped by destination folder into **multi-source pushes** chunked to a
+16 KB command budget; directory creation and timestamp restoration are
+grouped the same way (`makedirs_many`/`utime_many`) on the already-open
+persistent shell. Advanced options (`--del`, `--exclude`, `--dry-run`,
+symlink handling, …) bypass the fast paths and run the classic executor
+unchanged, so their semantics are byte-for-byte identical.
+
 Also fixed along the way (correctness, not speed): transfer exit codes are
 now checked (a failed copy is no longer reported as successful), the diff
 compares size plus mtime (same-minute changes and partial files are no
