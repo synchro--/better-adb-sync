@@ -42,6 +42,7 @@ contract; the other suites build on it.
 | `BETTER_ADBSYNC_FAKE_LOCAL_ROOT` | *Extension.* When set (the fixtures always set it to `tmp_path`), local paths used as push sources or pull destinations must resolve beneath it or the command fails. |
 | `BETTER_ADBSYNC_FAKE_NO_DEVICE` | *Extension.* Non-empty: `devices` lists nothing, `get-state` and the `:` shell test fail like an unconnected host (used for completion/no-device behavior). |
 | `BETTER_ADBSYNC_FAKE_TZ_OFFSET` | *Extension.* Device UTC offset in `date +%z` format (default `+0000`). Models a non-UTC device: `ls` renders mtimes as device-local wall clock (epoch + offset), `date +%z` reports the value, and `touch` keeps parsing with `calendar.timegm` (matching real toybox on the reference device). The product subtracts the offset when parsing `ls` output. |
+| `BETTER_ADBSYNC_FAKE_TZ` | *Extension.* IANA zone name (e.g. `Europe/Rome`); takes precedence over `..._TZ_OFFSET` and models a real DST device faithfully: `ls` renders each mtime with the DST offset in effect at that file's epoch, `touch` parses its string as local *standard* time (stored = timegm(string) − standard_offset, measured on the reference device), `getprop persist.sys.timezone` reports the zone and `date +%z` the current offset. Requires host tzdata for the zone. |
 
 Emulated surface: persistent `adb shell` speaking the exact
 `ADBSYNC END OF COMMAND` sentinel protocol of `Android.py` (including the
@@ -62,14 +63,18 @@ docstring of `fake_adb.py`):
   `touch: ...: No such file or directory`. Timestamp updates must not paper
   over a missing or partial transfer.
 * ls/realpath timestamps are formatted in the fake device's timezone: UTC by
-  default, or shifted by `BETTER_ADBSYNC_FAKE_TZ_OFFSET` to model a non-UTC
-  device. The product parses them with `calendar.timegm`
-  (`FileSystems/date_utils.py`) and subtracts the device offset (probed once
-  via `date +%z`); with the default offset round trips stay exact.
+  default, shifted by `BETTER_ADBSYNC_FAKE_TZ_OFFSET` to model a fixed-offset
+  device, or -- with `BETTER_ADBSYNC_FAKE_TZ` set to an IANA zone -- rendered
+  with the DST offset in effect at each file's own epoch. The product
+  resolves them with host tzdata (zone probed once via `getprop
+  persist.sys.timezone`, falling back to the constant `date +%z` offset);
+  with the default offset round trips stay exact.
 * `touch` interprets its `[[CC]YY]MMDDhhmm` string with `calendar.timegm`
-  (UTC wall clock) regardless of the fake timezone — matching real toybox on
-  the reference device, where the stored epoch is the UTC interpretation of
-  the string.
+  (UTC wall clock) regardless of the fake timezone -- except in
+  `BETTER_ADBSYNC_FAKE_TZ` zone mode, where it parses as local *standard*
+  time (stored = timegm(string) − standard_offset), which is what the
+  reference device was directly measured to do for winter and summer
+  strings alike.
 * File mode bits are not preserved; mtimes are (push always, pull with `-a`;
   adbsync re-applies mtimes itself afterwards anyway).
 * The fake never execs any external command — not even `python` helpers — and

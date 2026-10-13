@@ -17,7 +17,7 @@ import pytest
 
 from BetterADBSync.FileSystems.Android import AndroidFileSystem
 
-from conftest import FAKE_ADB, device_write, tree_digest, write_tree
+from conftest import FAKE_ADB, device_write, require_zone, tree_digest, write_tree
 
 SENTINEL = "ADBSYNC END OF COMMAND"
 MINUTE = 60
@@ -530,3 +530,154 @@ def test_android_fs_probes_date_offset_once_before_listings(fs, harness):
 
     dates = harness.log.shell_commands("date")
     assert len(dates) == 1
+
+
+# --- IANA zone modelling (BETTER_ADBSYNC_FAKE_TZ) ---------------------------
+#
+# Zone mode models a real Europe/Rome-like device faithfully: `ls` renders
+# each mtime with the DST offset in effect at that file's own epoch, `touch`
+# parses its time string as local *standard* time (like mktime with
+# tm_isdst=0, measured on the reference device for winter and summer
+# strings alike), `getprop persist.sys.timezone` reports the zone name and
+# `date +%z` the offset in effect right now. It takes precedence over
+# BETTER_ADBSYNC_FAKE_TZ_OFFSET when both are set.
+
+ROME = "Europe/Rome"
+# 2023-11-14 22:15:23 UTC (CET, +0100) and 2024-06-15 12:00:00 UTC (CEST,
+# +0200). WINTER_* reuse the module's FIXED constants where they exist.
+WINTER = 1_700_000_123
+WINTER_MINUTE = WINTER - (WINTER % 60)
+SUMMER = 1_718_452_800
+SUMMER_MINUTE = SUMMER - (SUMMER % 60)
+
+
+def test_zone_ls_renders_per_epoch_dst_offsets(harness):
+    require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    device_write(harness, "/sdcard/tz/winter.txt", b"w", mtime=WINTER)
+    device_write(harness, "/sdcard/tz/summer.txt", b"s", mtime=SUMMER)
+
+    result = harness.run_fake("shell", "ls", "-lab", "/sdcard/tz")
+    assert result.returncode == 0
+    # November file: CET wall clock (+0100); June file: CEST (+0200).
+    winter_tm = time.gmtime(WINTER_MINUTE + 3600)
+    winter_stamp = "%04d-%02d-%02d %02d:%02d" % (
+        winter_tm.tm_year, winter_tm.tm_mon, winter_tm.tm_mday, winter_tm.tm_hour, winter_tm.tm_min)
+    summer_tm = time.gmtime(SUMMER_MINUTE + 7200)
+    summer_stamp = "%04d-%02d-%02d %02d:%02d" % (
+        summer_tm.tm_year, summer_tm.tm_mon, summer_tm.tm_mday, summer_tm.tm_hour, summer_tm.tm_min)
+    assert winter_stamp in result.stdout
+    assert summer_stamp in result.stdout
+
+
+def test_zone_touch_parses_standard_time_in_both_seasons(harness):
+    require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    for epoch in (WINTER_MINUTE, SUMMER_MINUTE):
+        device_file = device_write(harness, "/sdcard/tz/f.txt", b"x", mtime=epoch)
+        tm = time.gmtime(epoch)
+        stamp = "%04d%02d%02d%02d%02d" % (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min)
+        result = harness.run_fake("shell", "touch", "-mt", stamp, "/sdcard/tz/f.txt")
+        assert result.returncode == 0
+        # Device parses the string as local standard time (UTC+1 for Rome).
+        assert device_file.stat().st_mtime == epoch - 3600
+
+
+def test_zone_getprop_reports_zone_and_date_reports_current_offset(harness):
+    zone = require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    result = harness.run_fake("shell", "getprop", "persist.sys.timezone")
+    assert result.returncode == 0
+    assert result.stdout.strip() == ROME
+
+    import datetime
+    now = time.time()
+    expected_seconds = int(zone.utcoffset(
+        datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc)).total_seconds())
+    sign = "+" if expected_seconds >= 0 else "-"
+    expected = "%s%02d%02d" % (sign, abs(expected_seconds) // 3600, (abs(expected_seconds) % 3600) // 60)
+    result = harness.run_fake("shell", "date", "+%z")
+    assert result.returncode == 0
+    assert result.stdout.strip() == expected
+
+
+def test_zone_takes_precedence_over_fixed_offset(harness):
+    require_zone(ROME)
+    harness.set_tz_offset("+0500")
+    harness.set_tz_zone(ROME)
+    device_write(harness, "/sdcard/tz/winter.txt", b"w", mtime=WINTER)
+    result = harness.run_fake("shell", "ls", "-lab", "/sdcard/tz")
+    assert result.returncode == 0
+    winter_tm = time.gmtime(WINTER_MINUTE + 3600)
+    winter_stamp = "%04d-%02d-%02d %02d:%02d" % (
+        winter_tm.tm_year, winter_tm.tm_mon, winter_tm.tm_mday, winter_tm.tm_hour, winter_tm.tm_min)
+    assert winter_stamp in result.stdout
+
+
+def test_zone_rejects_unknown_zone(harness):
+    harness.set_tz_zone("Mars/Olympus_Mons")
+    result = harness.run_fake("shell", "date", "+%z")
+    assert result.returncode == 2
+    assert "BETTER_ADBSYNC_FAKE_TZ" in result.stderr
+
+
+def test_android_fs_probes_zone_via_getprop(harness, tmp_path):
+    """In zone mode the product probes getprop once per run, no `date`.
+
+    NOTE: the filesystem object must be created *after* set_tz_zone --
+    the fake reads its environment once at (persistent-shell) process
+    start, so the shared `fs` fixture would see a zone-less environment.
+    """
+    require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    filesystem = AndroidFileSystem([str(FAKE_ADB)], "UTF-8", False)
+    try:
+        harness.sdcard  # ensure /sdcard exists
+        filesystem.test_connection()
+        list(filesystem.lstat_in_dir("/sdcard"))
+        filesystem.lstat("/sdcard")
+        list(filesystem.lstat_in_dir("/sdcard"))  # memoized: no second probe
+
+        getprops = harness.log.shell_commands("getprop")
+        dates = harness.log.shell_commands("date")
+        assert len(getprops) == 1
+        assert len(dates) == 0
+    finally:
+        del filesystem
+
+
+# --- wall-clock <-> epoch resolution unit tests ----------------------------
+
+
+def test_wall_clock_to_epoch_prefers_later_on_fall_back_ambiguity(fs, harness):
+    """02:30 on 2024-10-27 happened twice in Rome; resolve to the later one.
+
+    The later epoch parses back to a source that is never *newer* than the
+    destination, so at worst an mtime-only change inside the repeated hour
+    is missed -- the other choice would re-copy forever.
+    """
+    fs._tzinfo = require_zone(ROME)
+    fs._timezone_probed = True
+    t0 = calendar.timegm(time.strptime("2024-10-27 02:30", "%Y-%m-%d %H:%M"))
+    assert fs._wall_clock_to_epoch("2024-10-27 02:30") == t0 - 3600
+
+
+def test_wall_clock_to_epoch_spring_gap_falls_back(fs, harness):
+    """02:30 on 2024-03-31 never existed in Rome; deterministic fallback."""
+    fs._tzinfo = require_zone(ROME)
+    fs._timezone_probed = True
+    t0 = calendar.timegm(time.strptime("2024-03-31 02:30", "%Y-%m-%d %H:%M"))
+    assert fs._wall_clock_to_epoch("2024-03-31 02:30") == t0 - 7200
+
+
+def test_format_touch_times_floors_to_minute(fs, harness):
+    """Sub-minute seconds must never round the touch string up."""
+    fs._tzinfo = None
+    fs._timezone_probed = True
+    atime, mtime = fs._format_touch_times((WINTER, WINTER))
+    assert (atime, mtime) == ("202311142215", "202311142215")
+
+    fs._tzinfo = require_zone(ROME)
+    atime, mtime = fs._format_touch_times((WINTER, WINTER))
+    # Zone mode compensates the device's standard-time touch parsing.
+    assert (atime, mtime) == ("202311142315", "202311142315")

@@ -44,7 +44,34 @@ Default to a summary (counts/bytes copied, skipped, failed, elapsed time). Keep 
 - Check every transfer process result and include direction, path/batch, and useful stderr in failures.
 - Never update destination timestamps after a failed transfer.
 - Extend metadata comparisons to include size plus mtime, with tests for minute-resolution collisions and partial files. Preserve the current source-vs-destination timestamp conflict rule unless an explicit behavior change is approved.
-- Parse device mtimes timezone-correctly: `ls` prints device-local wall clock, but the product parses it as UTC, so on a non-UTC device every parsed mtime carries the device's UTC offset as error (observed: a UTC+1 phone made changed files look one hour in the future, and would make `adb pull -a` fast-path reruns re-copy whole trees). Probe the offset once per run with `date +%z` on the persistent shell, subtract it when parsing `ls` output, and leave `touch` formatting unchanged — real toybox interprets its time string as UTC, i.e. stores the epoch the string denotes. Fall back to offset 0 (old behavior) when the probe fails. Fake ADB models the offset via `BETTER_ADBSYNC_FAKE_TZ_OFFSET`.
+- Parse device mtimes timezone-correctly. Device time semantics were
+  measured directly on the reference device (OnePlus Nord, Europe/Rome)
+  and are subtler than "device-local wall clock":
+  - `adb push` stores the exact source epoch (canary round-trip exact).
+  - `ls` renders each mtime with the DST offset **in effect at that file's
+    own epoch** (a November file shows +0100, a June file +0200).
+  - `touch -mt STRING` parses STRING as local **standard** time
+    (stored = timegm(STRING) − std_offset, verified for winter and summer
+    strings alike) -- *not* as UTC, contrary to an earlier assumption.
+  - `date +%z` reports the offset **right now** only, so a constant offset
+    is wrong for files dated in the other DST season: winter files parse
+    1 h too old and are re-copied on every run (observed live: a
+    screenshots no-op re-pushed 6 winter-dated files), while the mirror
+    image silently skips genuinely changed files.
+  Probe the IANA zone once per run via `getprop persist.sys.timezone` on
+  the persistent shell (zero extra adb processes) and resolve every
+  timestamp host-side with `zoneinfo`: wall→epoch candidates from the
+  offsets around the stamp (±2 days), keep round-tripping candidates,
+  prefer the later epoch on the ambiguous fall-back hour (at worst an
+  mtime-only change inside the repeated hour is missed; size changes are
+  still caught). Format `touch` strings as the UTC wall clock of
+  t + std_offset so the device stores exactly t. Fallback chain: constant
+  `date +%z` offset (previous behavior), else 0 (historical UTC
+  behavior). Host-side conversions must go through `astimezone` -- calling
+  `zone.utcoffset()` on a datetime whose tzinfo is `datetime.timezone.utc`
+  reinterprets the UTC fields as zone-local on some interpreters (wrong
+  answers near transitions). Fake ADB models all of this via
+  `BETTER_ADBSYNC_FAKE_TZ` (see tests/README.md).
 - Batch timestamp restoration where possible; only remove/replace it with ADB-native metadata handling after tests prove equivalent behavior.
 - Do not hash all files by default; that would read every byte on each run.
 

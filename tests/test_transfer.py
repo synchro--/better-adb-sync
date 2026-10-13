@@ -13,7 +13,7 @@ import os
 
 import pytest
 
-from conftest import device_write, tree_digest, write_tree
+from conftest import device_write, require_zone, tree_digest, write_tree
 
 # Fixed, recognizable mtimes. FIXED is not minute-aligned on purpose so that
 # minute-truncation in Base.py/Android.py is observable.
@@ -535,4 +535,93 @@ def test_pull_classic_rerun_with_non_utc_device_is_noop(harness, tmp_path):
 
     harness.reset_log()
     harness.run_adbsync("pull", "/sdcard/f.txt", str(dest), expect=0)
+    assert harness.log.count_transfers("pull") == 0
+
+
+# --- IANA zone devices (BETTER_ADBSYNC_FAKE_TZ) ------------------------------
+#
+# Regression tests for a real-device finding (OnePlus Nord, Europe/Rome):
+# with only the constant `date +%z` offset, files dated in the other DST
+# season parse 1 h off and are re-copied on EVERY run (observed live: a
+# screenshots no-op re-pushed 6 winter-dated files). In zone mode the
+# product resolves each mtime with the offset in effect at that epoch and
+# compensates `touch` for the device's standard-time parsing, so reruns
+# are stable no-ops and stamped mtimes round-trip exactly.
+
+ROME = "Europe/Rome"
+SUMMER = 1_718_452_800  # 2024-06-15 12:00:00 UTC (CEST, +0200)
+SUMMER_MINUTE = SUMMER - (SUMMER % 60)
+
+
+def _write_season_tree(base):
+    """Host tree with one winter- and one summer-dated file per directory."""
+    spec = {}
+    for d in ("a", "b"):
+        spec[f"{d}/winter.txt"] = b"winter-content"
+        spec[f"{d}/summer.txt"] = b"summer-content"
+    write_tree(base, spec)
+    os.utime(base / "a" / "winter.txt", (FIXED, FIXED))
+    os.utime(base / "b" / "winter.txt", (FIXED, FIXED))
+    os.utime(base / "a" / "summer.txt", (SUMMER, SUMMER))
+    os.utime(base / "b" / "summer.txt", (SUMMER, SUMMER))
+    return base
+
+
+def test_push_rerun_stable_across_dst_seasons(harness, tmp_path):
+    require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    src = _write_season_tree(tmp_path / "host")
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest/", expect=0)
+
+    harness.reset_log()
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest/", expect=0)
+    assert harness.log.count_transfers("push") == 0
+
+
+def test_push_touch_roundtrip_exact_in_zone_mode(harness, tmp_path):
+    require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    src = _write_season_tree(tmp_path / "host")
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest/", expect=0)
+    # The initial push takes the recursive fast path (no `touch`; the
+    # transfer itself preserves exact epochs). Bumping forces the planner
+    # + batched path, whose `touch` compensation must land exactly on the
+    # minute-truncated source -- for both DST seasons.
+    os.utime(src / "a" / "winter.txt", (FIXED + 61, FIXED + 61))
+    os.utime(src / "a" / "summer.txt", (SUMMER + 61, SUMMER + 61))
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest/", expect=0)
+    assert harness.device_path("sdcard/dest/a/winter.txt").stat().st_mtime == FIXED_MINUTE + 60
+    assert harness.device_path("sdcard/dest/a/summer.txt").stat().st_mtime == SUMMER_MINUTE + 60
+
+
+def test_push_incremental_then_stable_in_zone_mode(harness, tmp_path):
+    require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    src = _write_season_tree(tmp_path / "host")
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest/", expect=0)
+
+    # +600 s bumps stay inside their DST season on both files.
+    os.utime(src / "a" / "winter.txt", (FIXED + 600, FIXED + 600))
+    os.utime(src / "b" / "summer.txt", (SUMMER + 600, SUMMER + 600))
+    harness.reset_log()
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest/", expect=0)
+    assert harness.log.count_transfers("push") == 2
+    assert harness.device_path("sdcard/dest/a/winter.txt").stat().st_mtime == FIXED_MINUTE + 600
+    assert harness.device_path("sdcard/dest/b/summer.txt").stat().st_mtime == SUMMER_MINUTE + 600
+
+    harness.reset_log()
+    harness.run_adbsync("push", str(src) + "/", "/sdcard/dest/", expect=0)
+    assert harness.log.count_transfers("push") == 0
+
+
+def test_pull_noop_stable_across_dst_seasons(harness, tmp_path):
+    require_zone(ROME)
+    harness.set_tz_zone(ROME)
+    device_write(harness, "/sdcard/tree/winter.txt", b"winter-content", mtime=FIXED_MINUTE)
+    device_write(harness, "/sdcard/tree/summer.txt", b"summer-content", mtime=SUMMER_MINUTE)
+    dest = tmp_path / "dest"
+    harness.run_adbsync("pull", "/sdcard/tree/", str(dest), expect=0)
+
+    harness.reset_log()
+    harness.run_adbsync("pull", "/sdcard/tree/", str(dest), expect=0)
     assert harness.log.count_transfers("pull") == 0

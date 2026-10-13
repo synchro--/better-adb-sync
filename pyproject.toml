@@ -6,6 +6,10 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = [ "LICENSE" ]
 requires-python = ">= 3.10"
+dependencies = [
+    # zoneinfo needs the IANA database; macOS/Linux provide it via the OS.
+    "tzdata; platform_system == 'Windows'",
+]
 
 [build-system]
 requires = ["setuptools>=61"]

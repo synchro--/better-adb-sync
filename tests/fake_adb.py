@@ -52,6 +52,15 @@ Environment variables (the fake-device contract):
     ``calendar.timegm`` (matching real toybox, which stores the UTC epoch the
     string denotes). The product must subtract the offset when parsing ls
     output to recover true epochs.
+``BETTER_ADBSYNC_FAKE_TZ`` (optional)
+    IANA zone name (e.g. ``Europe/Rome``). Takes precedence over
+    ``BETTER_ADBSYNC_FAKE_TZ_OFFSET`` and models a real DST device
+    faithfully: ``ls`` renders each mtime with the DST offset in effect at
+    that file's own epoch, ``touch`` parses its time string as local
+    *standard* time (stored = timegm(string) - standard_offset, measured on
+    the reference device for winter and summer strings alike),
+    ``getprop persist.sys.timezone`` reports the zone name and ``date +%z``
+    the offset in effect right now. Requires host tzdata for the zone.
 ``BETTER_ADBSYNC_FAKE_NO_DEVICE`` (optional)
     When set to a non-empty value the fake pretends no device is attached:
     ``devices`` lists nothing, ``get-state`` fails and the ``:`` shell test
@@ -75,10 +84,13 @@ Deliberate deviations from real adb (documented in tests/README.md):
 * ``touch`` interprets its ``[[CC]YY]MMDDhhmm`` string with
   ``calendar.timegm`` (UTC wall clock) regardless of the fake timezone --
   matching real toybox on the reference device, where the stored epoch is
-  the UTC interpretation of the string.
+  the UTC interpretation of the string. (In ``BETTER_ADBSYNC_FAKE_TZ`` zone
+  mode ``touch`` instead parses as local *standard* time, which is what the
+  reference device was measured to do.)
 """
 
 import calendar
+import datetime
 import fnmatch
 import json
 import os
@@ -90,6 +102,11 @@ import stat
 import sys
 import time
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None
+
 SENTINEL = "ADBSYNC END OF COMMAND"
 STDIN_REDIRECT_SUFFIX = " </dev/null"
 
@@ -100,6 +117,7 @@ ENV_FAIL = "BETTER_ADBSYNC_FAKE_FAIL"
 ENV_LOCAL_ROOT = "BETTER_ADBSYNC_FAKE_LOCAL_ROOT"
 ENV_NO_DEVICE = "BETTER_ADBSYNC_FAKE_NO_DEVICE"
 ENV_TZ_OFFSET = "BETTER_ADBSYNC_FAKE_TZ_OFFSET"
+ENV_TZ = "BETTER_ADBSYNC_FAKE_TZ"
 
 # adb global options that consume a separate value.
 GLOBAL_VALUE_OPTS = ("-s", "-t", "-H", "-P", "-L")
@@ -159,6 +177,25 @@ class Context:
         self.rules = self._parse_fail_spec(environ.get(ENV_FAIL, ""))
         self.tz_offset_str, self.tz_offset = parse_tz_offset(
             environ.get(ENV_TZ_OFFSET, "+0000") or "+0000")
+        self.tz_zone_name = (environ.get(ENV_TZ) or "").strip()
+        self.tzinfo = None
+        self.tz_std_offset = 0
+        if self.tz_zone_name:
+            if ZoneInfo is None:
+                raise ConfigError(f"{ENV_TZ}: zoneinfo is unavailable on this Python")
+            try:
+                self.tzinfo = ZoneInfo(self.tz_zone_name)
+            except (KeyError, ValueError):
+                raise ConfigError(f"{ENV_TZ}: unknown zone {self.tz_zone_name!r}")
+            # Standard offset = utcoffset - dst (constant across the year);
+            # this is what the reference device's `touch` parses with.
+            # (Convert via astimezone: zone.utcoffset() on a foreign-tz
+            # datetime is not portable near DST transitions.)
+            probe = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+            probe = probe.astimezone(self.tzinfo)
+            off = probe.utcoffset()
+            dst = probe.dst() or datetime.timedelta(0)
+            self.tz_std_offset = int((off - dst).total_seconds())
 
     @staticmethod
     def _parse_fail_spec(spec):
@@ -227,6 +264,22 @@ class Context:
 # --- logging ---------------------------------------------------------------
 
 
+def offset_for_mtime(ctx, mtime):
+    """Device UTC offset (seconds east of UTC) in effect at epoch `mtime`.
+
+    Zone mode resolves the offset per epoch via tzdata (DST-aware);
+    otherwise the configured constant offset applies. NOTE: the conversion
+    must go through astimezone -- calling zone.utcoffset() directly on a
+    datetime whose tzinfo is datetime.timezone.utc reinterprets the UTC
+    wall fields as zone-local fields on some interpreters (wrong answers
+    near DST transitions).
+    """
+    if ctx.tzinfo is not None:
+        moment = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+        return int(moment.astimezone(ctx.tzinfo).utcoffset().total_seconds())
+    return ctx.tz_offset
+
+
 def append_log(entry):
     path = os.environ.get(ENV_LOG)
     if not path:
@@ -263,8 +316,7 @@ def log_process(argv, command, exit_code, stats, started_ts, duration_ms):
     })
 
 
-def log_shell_cmd(tokens, exit_code, output_lines, duration_ms):
-    append_log({
+def log_shell_cmd(tokens, exit_code, output_lines, duration_ms):    append_log({
         "kind": "shell_cmd",
         "ts": time.time(),
         "pid": os.getpid(),
@@ -410,7 +462,7 @@ def cmd_ls(tokens, ctx):
             continue
         st = os.lstat(host)
         if (not stat.S_ISDIR(st.st_mode)) or ("d" in flags):
-            lines.append(ls_line(raw, st, escape, ctx.tz_offset))
+            lines.append(ls_line(raw, st, escape, offset_for_mtime(ctx, st.st_mtime)))
             continue
         # Directory listing without -d: 'total N' header plus entries.
         try:
@@ -429,7 +481,7 @@ def cmd_ls(tokens, ctx):
                 lines.append(f"ls: {raw}: {e.strerror}")
                 status = 1
                 continue
-            lines.append(ls_line(name, child_st, escape, ctx.tz_offset))
+            lines.append(ls_line(name, child_st, escape, offset_for_mtime(ctx, child_st.st_mtime)))
     return lines, status
 
 
@@ -525,6 +577,10 @@ def cmd_touch(tokens, ctx):
         arg = args[i]
         if arg in ("-at", "-mt", "-t") and i + 1 < len(args):
             value = parse_time_string(args[i + 1])
+            if ctx.tzinfo is not None:
+                # Zone mode: the reference device parses the string as
+                # local *standard* time (measured, both DST seasons).
+                value -= ctx.tz_std_offset
             if arg in ("-at", "-t"):
                 atime, want_atime = value, True
             if arg in ("-mt", "-t"):
@@ -577,10 +633,22 @@ def cmd_touch(tokens, ctx):
 
 
 def cmd_date(tokens, ctx):
-    # The product probes the device UTC offset with `date +%z` once per run.
+    # The product probes the device UTC offset with `date +%z` once per run
+    # (fallback when no usable IANA zone was reported by `getprop`).
     if tokens[1:] == ["+%z"]:
+        if ctx.tzinfo is not None:
+            seconds = offset_for_mtime(ctx, time.time())
+            sign = "+" if seconds >= 0 else "-"
+            return ["%s%02d%02d" % (sign, abs(seconds) // 3600, (abs(seconds) % 3600) // 60)], 0
         return [ctx.tz_offset_str], 0
     return ["date: only the +%z format is supported by fake adb"], 1
+
+
+def cmd_getprop(tokens, ctx):
+    # The product probes the device IANA zone for per-epoch DST handling.
+    if tokens[1:] == ["persist.sys.timezone"]:
+        return [ctx.tz_zone_name], 0
+    return [""], 0
 
 
 def execute_shell_command(tokens, ctx):
@@ -596,6 +664,8 @@ def execute_shell_command(tokens, ctx):
         return [" ".join(tokens[1:])], 0
     if cmd == "date":
         return cmd_date(tokens, ctx)
+    if cmd == "getprop":
+        return cmd_getprop(tokens, ctx)
     if cmd == "ls":
         return cmd_ls(tokens, ctx)
     if cmd == "realpath":

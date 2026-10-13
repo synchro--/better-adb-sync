@@ -1,5 +1,5 @@
 import errno
-from typing import Dict, Iterable, Iterator, List, NoReturn, Tuple
+from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Tuple
 import logging
 import os
 import re
@@ -7,6 +7,11 @@ import stat
 import shlex
 import datetime
 import subprocess
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None
 
 from .date_utils import datetime_string_to_posix_timestamp
 from ..SAOLogging import logging_fatal
@@ -68,10 +73,14 @@ class AndroidFileSystem(FileSystem):
     def __init__(self, adb_arguments: List[str], adb_encoding: str, skip_permission_denied: bool) -> None:
         super().__init__(adb_arguments, skip_permission_denied)
         self.adb_encoding = adb_encoding
-        # Device UTC offset in seconds (east of UTC) for timezone-correct ls
-        # parsing; probed once per run by _ensure_utc_offset(). 0 = UTC/unknown.
+        # Device timezone for timezone-correct ls parsing / touch
+        # formatting, probed once per run by _ensure_timezone(). _tzinfo None
+        # means "no usable IANA zone": fall back to the constant
+        # _utc_offset_seconds from `date +%z` (0 = UTC/unknown, preserving
+        # the long-standing UTC behavior).
+        self._tzinfo: Optional[datetime.tzinfo] = None
         self._utc_offset_seconds = 0
-        self._utc_offset_probed = False
+        self._timezone_probed = False
         self.proc_adb_shell = subprocess.Popen(
             self.adb_arguments + ["shell"],
             stdin=subprocess.PIPE,
@@ -110,38 +119,102 @@ class AndroidFileSystem(FileSystem):
         logging.critical("ADB line not captured")
         logging_fatal(line)
 
-    def _ensure_utc_offset(self) -> None:
-        """Probe the device UTC offset once per run (`date +%z`) and cache it.
+    def _ensure_timezone(self) -> None:
+        """Probe the device timezone once per run and cache it.
 
-        `ls` prints mtimes as device-local wall clock while this class parses
-        them as UTC (calendar.timegm), so on a non-UTC device every parsed
-        mtime carries the device's UTC offset as error. The offset is probed
-        once on the persistent shell and subtracted in ls_to_stat. `touch`
-        needs no correction: real toybox interprets its time string as UTC,
-        i.e. stores the epoch the string denotes (verified against the
-        reference device: utime'd files keep their true epoch).
+        The device `ls` prints mtimes as device-local wall clock while tree
+        comparisons need true epochs, and the offset depends on the DST rules
+        in effect at each file's own epoch (measured on the reference
+        device: a November file renders at +0100, a June file at +0200 in
+        Europe/Rome). Probing the IANA zone name via `getprop` lets the
+        host resolve every timestamp with its own tzdata (see
+        _wall_clock_to_stat); `touch` needs the zone's *standard* offset
+        because real toybox parses its time string as local standard time
+        (measured: stored = timegm(string) - std_offset in all seasons).
+
+        Fallback chain when no usable zone is reported (unusual ROMs, no
+        host tzdata): the constant offset from `date +%z` (previous
+        behavior), else 0 (UTC, the historical behavior). Both probes ride
+        the persistent shell: no additional adb processes per run.
 
         The probe must not run while another adb_shell iteration is in
         progress on the shared shell process, so every caller invokes it
         before starting its own iteration (this method completes the whole
         command, including reading until the sentinel, before returning).
-
-        A failed or unparsable probe (no `date`, unusual output) leaves the
-        offset at 0, preserving the long-standing UTC behavior.
         """
-        if self._utc_offset_probed:
+        if self._timezone_probed:
             return
+        tzinfo = None
+        if ZoneInfo is not None:
+            for line in self.adb_shell(["getprop", "persist.sys.timezone"]):
+                name = line.strip()
+                if name:
+                    try:
+                        tzinfo = ZoneInfo(name)
+                    except (KeyError, ValueError):
+                        logging.info(f"Android device timezone {name!r} not usable host-side;"
+                                     " falling back to date +%z")
+                        tzinfo = None
+                    break
         offset = 0
-        for line in self.adb_shell(["date", "+%z"]):
-            match = re.fullmatch(r"([+-])(\d{2})(\d{2})", line.strip())
-            if match:
-                sign = 1 if match.group(1) == "+" else -1
-                offset = sign * (int(match.group(2)) * 3600 + int(match.group(3)) * 60)
-                break
-        if offset != 0:
-            logging.info(f"Android device UTC offset: {offset:+d} seconds")
+        if tzinfo is None:
+            for line in self.adb_shell(["date", "+%z"]):
+                match = re.fullmatch(r"([+-])(\d{2})(\d{2})", line.strip())
+                if match:
+                    sign = 1 if match.group(1) == "+" else -1
+                    offset = sign * (int(match.group(2)) * 3600 + int(match.group(3)) * 60)
+                    break
+        else:
+            logging.info(f"Android device timezone: {tzinfo.key}")
+        self._tzinfo = tzinfo
         self._utc_offset_seconds = offset
-        self._utc_offset_probed = True
+        self._timezone_probed = True
+
+    def _wall_clock_to_epoch(self, wall: str) -> int:
+        """Convert an `ls` wall-clock stamp ("YYYY-MM-DD HH:MM") to an epoch.
+
+        The stamp has minute resolution. In constant-offset mode the probed
+        offset is subtracted (previous behavior). In zone mode the offset in
+        effect at the file's own epoch is resolved via tzdata: candidate
+        epochs are built from the offsets around the stamp (±2 days covers
+        any DST transition), candidates that do not round-trip are dropped,
+        and the latest surviving candidate wins. Preferring the later epoch
+        on the ambiguous fall-back hour means an mtime-only change inside
+        the repeated hour is at worst missed (size changes are still
+        caught); the other choice would re-copy the file on every run.
+        A stamp in a spring-forward gap (no valid candidate) falls back to
+        the offset in effect at the stamp itself; real `ls` output can never
+        hit that branch since the device only renders existing instants.
+        """
+        t0 = int(datetime_string_to_posix_timestamp(wall))
+        zone = self._tzinfo
+        if zone is None:
+            return t0 - self._utc_offset_seconds
+
+        def offset_at(epoch: int) -> int:
+            # NOTE: convert via astimezone first. Calling
+            # zone.utcoffset() directly on a datetime whose tzinfo is
+            # datetime.timezone.utc reinterprets the UTC wall fields as
+            # zone-local fields on some interpreters (observed with the
+            # interpreter under test: +7200 instead of +3600 just after a
+            # fall-back transition); astimezone is the documented
+            # instant-preserving conversion and is correct everywhere.
+            moment = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+            return int(moment.astimezone(zone).utcoffset().total_seconds())
+
+        candidates = {t0 - offset_at(probe) for probe in (t0 - 172800, t0, t0 + 172800)}
+        valid = [c for c in candidates if t0 - c == offset_at(c)]
+        if valid:
+            return max(valid)
+        return t0 - offset_at(t0)
+
+    def _touch_std_offset(self) -> int:
+        """Standard offset of the device zone (what `touch -t` parses with)."""
+        zone = self._tzinfo
+        probe = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc).astimezone(zone)
+        off = probe.utcoffset()
+        dst = probe.dst() or datetime.timedelta(0)
+        return int((off - dst).total_seconds())
 
     def test_connection(self):
         for line in self.adb_shell([":"]):
@@ -152,7 +225,7 @@ class AndroidFileSystem(FileSystem):
                 continue
 
             raise BrokenPipeError
-        self._ensure_utc_offset()
+        self._ensure_timezone()
 
     def ls_to_stat(self, line: str) -> Tuple[str | None, os.stat_result]:
         if self.RE_NO_SUCH_FILE.fullmatch(line):
@@ -183,11 +256,10 @@ class AndroidFileSystem(FileSystem):
             if match_groupdict['S_IFSOCK']:
                 st_mode |= stat.S_IFSOCK
             st_size = None if match_groupdict["st_size"] is None else int(match_groupdict["st_size"])
-            # ls shows device-local wall clock; subtract the probed device UTC
-            # offset to recover the true epoch (0 on UTC devices/when unprobed,
-            # preserving the old behavior).
-            st_mtime = int(datetime_string_to_posix_timestamp(
-                match_groupdict["st_mtime"])) - self._utc_offset_seconds
+            # ls shows device-local wall clock; resolve it to the true epoch
+            # with the probed timezone (per-epoch DST in zone mode, constant
+            # offset otherwise, plain UTC parse when unprobed).
+            st_mtime = self._wall_clock_to_epoch(match_groupdict["st_mtime"])
 
             # Fill the rest with dummy values.
             st_ino = 1
@@ -242,25 +314,34 @@ class AndroidFileSystem(FileSystem):
         raise RuntimeError('Android: "realpath" no result')
 
     def lstat(self, path: str) -> os.stat_result:
-        self._ensure_utc_offset()
+        self._ensure_timezone()
         for line in self.adb_shell(["ls", "-ladb", path]):
             return self.ls_to_stat(line)[1]
         raise RuntimeError('Android: "ls -ladb" no result')
 
     def lstat_in_dir(self, path: str) -> Iterable[Tuple[str, os.stat_result]]:
-        self._ensure_utc_offset()
+        self._ensure_timezone()
         for line in self.adb_shell(["ls", "-lab", path]):
             if self.RE_TOTAL.fullmatch(line):
                 continue
             else:
                 yield self.ls_to_stat(line)
 
-    @staticmethod
-    def _format_touch_times(times: Tuple[int, int]) -> Tuple[str, str]:
+    def _format_touch_times(self, times: Tuple[int, int]) -> Tuple[str, str]:
         base = datetime.datetime(1970, 1, 1)
-        atime = (base + datetime.timedelta(seconds=times[0])).strftime("%Y%m%d%H%M")
-        mtime = (base + datetime.timedelta(seconds=times[1])).strftime("%Y%m%d%H%M")
-        return atime, mtime
+        atime, mtime = times
+        if self._tzinfo is not None:
+            # Device `touch` parses the string as local *standard* time
+            # (measured: stored = timegm(string) - std_offset in all
+            # seasons), so shift by the standard offset to store the true
+            # epoch. Sub-minute seconds are dropped by the "%Y%m%d%H%M"
+            # format (floor), matching the minute-truncated tree times.
+            shift = self._touch_std_offset()
+            atime += shift
+            mtime += shift
+        atime_str = (base + datetime.timedelta(seconds=atime)).strftime("%Y%m%d%H%M")
+        mtime_str = (base + datetime.timedelta(seconds=mtime)).strftime("%Y%m%d%H%M")
+        return atime_str, mtime_str
 
     def utime(self, path: str, times: Tuple[int, int]) -> None:
         atime, mtime = self._format_touch_times(times)

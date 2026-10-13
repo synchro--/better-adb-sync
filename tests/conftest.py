@@ -139,6 +139,14 @@ class Harness:
         """Model a device whose timezone is not UTC (date +%z format)."""
         self.monkeypatch.setenv("BETTER_ADBSYNC_FAKE_TZ_OFFSET", value)
 
+    def set_tz_zone(self, name):
+        """Model a device in IANA zone `name` (per-epoch DST, std-time touch).
+
+        Takes precedence over set_tz_offset in the fake. Requires host
+        tzdata for `name`; use require_zone() to skip cleanly without it.
+        """
+        self.monkeypatch.setenv("BETTER_ADBSYNC_FAKE_TZ", name)
+
     def run_fake(self, *args, input=None, timeout=60):
         """Invoke the fake adb directly (as a fresh process)."""
         return subprocess.run(
@@ -199,7 +207,17 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.delenv("BETTER_ADBSYNC_FAKE_FAIL", raising=False)
     monkeypatch.delenv("BETTER_ADBSYNC_FAKE_NO_DEVICE", raising=False)
     monkeypatch.delenv("BETTER_ADBSYNC_FAKE_TZ_OFFSET", raising=False)
+    monkeypatch.delenv("BETTER_ADBSYNC_FAKE_TZ", raising=False)
     return Harness(tmp_path, root, log_path, monkeypatch)
+
+
+def require_zone(name="Europe/Rome"):
+    """Return ZoneInfo(name), or skip the test if host tzdata lacks it."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        pytest.skip(f"host tzdata does not provide {name}")
 
 
 @pytest.fixture
