@@ -1,8 +1,10 @@
-# Better ADB Sync — optimized fork
+# Better ADB Sync but Faster 
 
 An [rsync](https://wiki.archlinux.org/title/rsync)-like program to sync files between a computer and an Android device — **same `adbsync` you know, up to 6× faster**.
 
-This is a performance + correctness fork of [jpstotz/better-adb-sync](https://github.com/jpstotz/better-adb-sync). Same CLI and path semantics, same data plane (plain `adb` CLI, no root/app needed) — just far fewer adb processes per run, plus fixes for silently skipped files, unreported copy failures, and timezone-related re-copy loops. Measured on a OnePlus Nord over USB; see [Performance](#performance) for the full table.
+This is a performance + correctness fork of [jpstotz/better-adb-sync](https://github.com/jpstotz/better-adb-sync). Same CLI and path semantics, same data plane (plain `adb` CLI, no root/app needed) with far fewer adb processes per run, plus fixes for silently skipped files, unreported copy failures, and timezone-related re-copy loops.
+
+Measured on a OnePlus Nord over USB; see [Performance](#performance) for the full table.
 
 | use case | upstream | this fork |
 |---|---|---|
@@ -112,16 +114,16 @@ the gain there is the removed per-file overhead (~25% on 5 GB of photos).
 
 How it differs from upstream, concretely: upstream walks both trees, then
 for **every file** spawns its own `adb push`/`adb pull` process plus its own
-`touch`/`mkdir` shell round-trips — N files cost N+ processes. This branch
+`touch`/`mkdir` shell round-trips, hence N files cost N+ processes. This branch
 keeps the same planner and conflict rules, but executes differently: a
 missing destination tree goes over in **one recursive `adb push`/`pull`**
 (the fast path, used for all initial copies); incremental changes are
 grouped by destination folder into **multi-source pushes** chunked to a
 16 KB command budget; directory creation and timestamp restoration are
-grouped the same way (`makedirs_many`/`utime_many`) on the already-open
-persistent shell. Advanced options (`--del`, `--exclude`, `--dry-run`,
-symlink handling, …) bypass the fast paths and run the classic executor
-unchanged, so their semantics are byte-for-byte identical.
+grouped the same way on the already-open persistent shell. 
+Advanced options (`--del`, `--exclude`, `--dry-run`, symlink handling, …) 
+bypass the fast paths and run the classic executor unchanged, 
+so their semantics are byte-for-byte identical.
 
 Also fixed along the way (correctness, not speed): transfer exit codes are
 now checked (a failed copy is no longer reported as successful), the diff
