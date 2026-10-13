@@ -1,6 +1,18 @@
-# Better ADB Sync
+# Better ADB Sync — optimized fork
 
-An [rsync](https://wiki.archlinux.org/title/rsync)-like program to sync files between a computer and an Android device
+An [rsync](https://wiki.archlinux.org/title/rsync)-like program to sync files between a computer and an Android device — **same `adbsync` you know, up to 6× faster**.
+
+This is a performance + correctness fork of [jpstotz/better-adb-sync](https://github.com/jpstotz/better-adb-sync). Same CLI and path semantics, same data plane (plain `adb` CLI, no root/app needed) — just far fewer adb processes per run, plus fixes for silently skipped files, unreported copy failures, and timezone-related re-copy loops. Measured on a OnePlus Nord over USB; see [Performance](#performance) for the full table.
+
+| use case | upstream | this fork |
+|---|---|---|
+| pull 19,763 thumbnails (869 MB) | 906 s | **150 s (6× faster)** |
+| pull 1,051 photos (5.3 GB) | 224 s | **168 s (25% faster)** |
+| push 300 small files | ~24 s | **~7 s (3.4× faster)** |
+| pull 300 small files | ~7.4 s | **~0.9 s (8× faster)** |
+| no-op rerun (up to ~20k files) | 1 proc | 1 proc, ~2 s |
+
+Rule of thumb: **file count decides the win**. Thousands of small files (caches, thumbnails, chat media) improve the most; big media files are USB-bandwidth-bound.
 
 ## Installation
 
@@ -9,10 +21,10 @@ Preparation: Make sure BetterADBSync version from PyPi.org is no longer installe
 $ pip uninstall BetterADBSync
 ```
 
-Download and install BetterADBSync fork from GitHub 
+Download and install this fork from GitHub
 
 ```
-$ git clone https://github.com/jpstotz/better-adb-sync.git
+$ git clone https://github.com/synchro--/better-adb-sync.git
 $ pip install better-adb-sync/
 ```
 
