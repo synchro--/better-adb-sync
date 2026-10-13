@@ -74,6 +74,36 @@ direction:
                         stdout
 ```
 
+## Performance
+
+Compared with upstream (`jpstotz/better-adb-sync` master), measured on a
+OnePlus Nord over USB (adb 37.0.1). Both sides transfer identical bytes;
+only the number of adb processes and the planning differ.
+
+| workload | upstream | this branch | difference |
+|---|---|---|---|
+| pull 19,763 thumbnails (869 MB) | 906 s, 19,764 procs | 150 s, 2 procs | **83% less time (6×)**, 99.99% fewer procs |
+| pull 1,051 photos (5.3 GB) | 224 s, 1,052 procs | 168 s, 2 procs | **25% less time**, 99.8% fewer procs |
+| push 300 small files | ~24 s, 301 procs | ~7 s, 2 procs | **71% less time**, 99.3% fewer procs |
+| pull 300 small files | ~7.4 s, 301 procs | ~0.9 s, 2 procs | **88% less time**, 99.3% fewer procs |
+| no-op rerun (up to 19,763 files) | 1 proc | 1 proc | unchanged, ~2 s at 19k files |
+
+Why it is faster: every `adb` process costs ~30–40 ms of startup/handshake
+before moving a single byte. Upstream spawns **one process per file**; this
+branch copies a whole tree with **one recursive `adb push`/`pull`** (fast
+path) and groups incremental changes into **batched multi-source pushes**,
+while `ls`/`mkdir`/`touch` ride a single persistent shell. File count, not
+total size, decides the win: thousands of small files (caches, thumbnails,
+chat media) improve the most; big media files are USB-bandwidth-bound, so
+the gain there is the removed per-file overhead (~25% on 5 GB of photos).
+
+Also fixed along the way (correctness, not speed): transfer exit codes are
+now checked (a failed copy is no longer reported as successful), the diff
+compares size plus mtime (same-minute changes and partial files are no
+longer invisible), and device mtimes are resolved with per-epoch DST via
+the probed IANA zone (files dated in the other DST season are neither
+re-copied forever nor silently skipped).
+
 ## Shell completion
 
 Tab completion for **Bash, Zsh and Fish** covers the subcommands (`push`,
