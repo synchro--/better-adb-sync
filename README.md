@@ -25,7 +25,8 @@ Download and install this fork from GitHub
 
 ```
 $ git clone https://github.com/synchro--/better-adb-sync.git
-$ pip install better-adb-sync/
+$ cd better-adb-sync && ./install.sh          # or: pip install ./
+$ ./install.sh --completion zsh               # optional tab completion (bash|zsh|fish)
 ```
 
 ## How to use
